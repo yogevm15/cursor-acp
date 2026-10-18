@@ -3,6 +3,7 @@ import {
 	applyFastValue,
 	applyThinkingValue,
 	buildSdkModelSelection,
+	contextWindowTokens,
 	getFastParameterForModel,
 	inferFastValueFromModelId,
 	mergeModelCatalogs,
@@ -164,5 +165,37 @@ describe("model id normalization", () => {
 				{ id: "fast", value: "true" },
 			],
 		});
+	});
+
+	it("sends the selected context window and ignores values the model does not offer", () => {
+		const catalog = [
+			{
+				modelId: "gpt-5.6-sol",
+				name: "GPT-5.6 Sol",
+				parameters: [
+					{
+						id: "context",
+						values: [{ value: "272k" }, { value: "1m" }],
+					},
+				],
+			},
+		];
+
+		expect(buildSdkModelSelection("gpt-5.6-sol", catalog, undefined, undefined, "1m")).toEqual({
+			id: "gpt-5.6-sol",
+			params: [{ id: "context", value: "1m" }],
+		});
+		expect(buildSdkModelSelection("gpt-5.6-sol", catalog, undefined, undefined, "2m")).toEqual({
+			id: "gpt-5.6-sol",
+		});
+	});
+
+	it("converts SDK context values to token counts", () => {
+		expect(contextWindowTokens("272k")).toBe(272_000);
+		expect(contextWindowTokens("1m")).toBe(1_000_000);
+		expect(contextWindowTokens("1.5M")).toBe(1_500_000);
+		expect(contextWindowTokens("200000")).toBe(200_000);
+		expect(contextWindowTokens("max")).toBeUndefined();
+		expect(contextWindowTokens(undefined)).toBeUndefined();
 	});
 });

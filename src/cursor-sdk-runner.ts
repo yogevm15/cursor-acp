@@ -12,6 +12,7 @@ import { applyCursorCliAttributionEnvironment } from "./cursor-cli-config.js";
 import {
 	sdkMessageToCursorStreamEvent,
 	sdkRunResultToCursorResultEvent,
+	sdkUsageToCursorUsageEvent,
 } from "./cursor-sdk-event-adapter.js";
 import { getCursorApiKey } from "./cursor-sdk-config.js";
 import { buildLocalAgentOptions } from "./cursor-sdk-local-options.js";
@@ -217,13 +218,20 @@ export class CursorSdkRunner implements CursorRunner {
 				return { events, resultEvent, stderr, exitCode: 0 };
 			}
 
+			const modelCallIds = new Set<string>();
 			const sendOptions: Parameters<SDKAgent["send"]>[1] = {
 				model: buildSdkModelSelection(
 					options.modelId ?? "auto",
 					options.modelCatalog,
 					options.thinkingLevel,
 					options.fastValue,
+					options.contextValue,
 				),
+				onDelta: ({ update }) => {
+					if (update.type === "tool-call-started") {
+						modelCallIds.add(update.modelCallId);
+					}
+				},
 				...(options.modeId === "plan" ? { mode: "plan" as const } : {}),
 				...(sdkMcpServers(options.mcpServers)
 					? { mcpServers: sdkMcpServers(options.mcpServers) }
@@ -278,6 +286,13 @@ export class CursorSdkRunner implements CursorRunner {
 						}
 					}
 					if (duplicateRunningToolCall) {
+						continue;
+					}
+					if (message.type === "usage") {
+						// Tool-calling model calls plus the final reply call.
+						await emit(
+							sdkUsageToCursorUsageEvent(message.usage, modelCallIds.size + 1),
+						);
 						continue;
 					}
 					for (const adapted of sdkMessageToCursorStreamEvent(message)) {
@@ -437,6 +452,7 @@ export class CursorSdkRunner implements CursorRunner {
 				options.modelCatalog,
 				options.thinkingLevel,
 				options.fastValue,
+				options.contextValue,
 			),
 			local: buildLocalAgentOptions(options.workspace, config.autoReview),
 			...(config.ask ? { tools: [] } : {}),

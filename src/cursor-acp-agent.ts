@@ -28,6 +28,7 @@ import {
 	SessionConfigOption,
 	SessionNotification,
 	ToolCallContent,
+	Usage,
 	WriteTextFileRequest,
 	WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
@@ -40,6 +41,12 @@ import {
 } from "./acp-request-extensions.js";
 import { CursorAuth, CursorAuthClient } from "./auth.js";
 import type { CursorAcpClient } from "./cursor-acp-client.js";
+import {
+	addAcpUsage,
+	estimateContextTokens,
+	toAcpUsage,
+	turnUsageFromEvent,
+} from "./context-usage.js";
 import { CachedToolUse, mapCursorEventToAcp, RejectedToolCall } from "./cursor-event-mapper.js";
 import {
 	CreateNativeSessionOptions,
@@ -58,19 +65,26 @@ import type {
 	LegacySetSessionModelResponse,
 } from "./legacy-session-models.js";
 import {
+	applyContextValue,
 	applyFastValue,
 	applyThinkingValue,
+	CONTEXT_PARAM_ID,
+	contextWindowTokens,
 	FAST_PARAM_ID,
 	findParameterModelInCatalog,
 	formatFastParameterOptionName,
+	getContextParameterForModel,
 	getFastParameterForModel,
 	getThinkingParameterForModel,
+	inferContextValueFromModelId,
 	inferFastValueFromModelId,
 	inferThinkingValueFromModelId,
+	isValidContextValue,
 	isValidFastValue,
 	isValidThinkingLevel,
 	mergeModelCatalogs,
 	normalizeModelId,
+	resolveDefaultContextValue,
 	resolveDefaultFastValue,
 	resolveDefaultThinkingLevel,
 	resolveModelId,
@@ -97,6 +111,7 @@ import {
 	AgentSessionModeId,
 	availableModes,
 	DEFAULT_MODE_ID,
+	getEnvDefaultContext,
 	getEnvDefaultMode,
 	getEnvDefaultModel,
 	getEnvDefaultThinking,
@@ -450,6 +465,38 @@ function fastCandidatesFrom(raw: LooseSessionDefaults): unknown[] {
 	];
 }
 
+function contextCandidatesFrom(raw: LooseSessionDefaults): unknown[] {
+	return [
+		raw.context,
+		raw.defaultContext,
+		raw.default_context,
+		raw.defaultConfigOptions?.context,
+		raw.default_config_options?.context,
+		raw._meta?.context,
+		raw._meta?.defaultContext,
+		raw._meta?.default_context,
+		raw._meta?.defaultConfigOptions?.context,
+		raw._meta?.default_config_options?.context,
+		raw.cursor?.context,
+		raw.cursor?.defaultContext,
+		raw.cursor?.default_context,
+		raw.cursor?.defaultConfigOptions?.context,
+		raw.cursor?.default_config_options?.context,
+		raw._meta?.cursor?.context,
+		raw._meta?.cursor?.defaultContext,
+		raw._meta?.cursor?.default_context,
+		raw._meta?.cursor?.defaultConfigOptions?.context,
+		raw._meta?.cursor?.default_config_options?.context,
+	];
+}
+
+function promptResponse(
+	stopReason: PromptResponse["stopReason"],
+	usage: Usage | undefined,
+): PromptResponse {
+	return usage ? { stopReason, usage } : { stopReason };
+}
+
 interface ActivePromptState {
 	assistantTextChunks: string[];
 	turnArtifacts: TurnArtifact[];
@@ -462,6 +509,7 @@ interface ActiveRunState {
 interface PromptAttemptResult {
 	stopReason: PromptResponse["stopReason"];
 	rejectedToolCalls: RejectedToolCall[];
+	usage?: Usage;
 }
 
 export interface SessionState {
@@ -475,6 +523,10 @@ export interface SessionState {
 	configuredThinkingLevel?: string;
 	fastValue?: string;
 	configuredFastValue?: string;
+	contextValue?: string;
+	configuredContextValue?: string;
+	/** Estimated tokens in the context window after the last completed turn. */
+	contextTokensUsed?: number;
 	lastAgentModeId: AgentSessionModeId;
 	cancelled: boolean;
 	activePrompt?: ActivePromptState;
@@ -518,6 +570,7 @@ export class CursorAcpAgent implements Agent {
 	private defaultModelId?: string;
 	private defaultThinkingLevel?: string;
 	private defaultFastValue?: string;
+	private defaultContextValue?: string;
 
 	private readonly runner: CursorRunner;
 	private readonly auth: CursorAuthClient;
@@ -550,6 +603,7 @@ export class CursorAcpAgent implements Agent {
 		this.defaultModelId = initDefaults.modelId ?? getEnvDefaultModel();
 		this.defaultThinkingLevel = initDefaults.thinkingLevel ?? getEnvDefaultThinking();
 		this.defaultFastValue = initDefaults.fastValue;
+		this.defaultContextValue = initDefaults.contextValue ?? getEnvDefaultContext();
 
 		const authMethod: NonNullable<InitializeResponse["authMethods"]>[number] = {
 			id: "cursor_login",
@@ -608,6 +662,7 @@ export class CursorAcpAgent implements Agent {
 			preferredModelId: this.extractRequestedInitialModel(params),
 			preferredThinkingLevel: this.extractRequestedInitialThinking(params),
 			preferredFastValue: this.extractRequestedInitialFast(params),
+			preferredContextValue: this.extractRequestedInitialContext(params),
 		});
 	}
 
@@ -630,6 +685,7 @@ export class CursorAcpAgent implements Agent {
 			preferredModelId: meta.modelId,
 			preferredThinkingLevel: meta.thinkingLevel,
 			preferredFastValue: meta.fastValue,
+			preferredContextValue: meta.contextValue,
 			preferredBackendSessionId: meta.backendSessionId,
 		});
 
@@ -726,6 +782,7 @@ export class CursorAcpAgent implements Agent {
 			preferredModelId: meta.modelId,
 			preferredThinkingLevel: meta.thinkingLevel,
 			preferredFastValue: meta.fastValue,
+			preferredContextValue: meta.contextValue,
 			preferredBackendSessionId: meta.backendSessionId,
 		});
 
@@ -873,11 +930,15 @@ export class CursorAcpAgent implements Agent {
 			}
 
 			if (approved === "allow_once" || approved === "allow_always") {
-				return await this.runPromptAttempt(session, promptText, promptImages, true);
+				const retry = await this.runPromptAttempt(session, promptText, promptImages, true);
+				return promptResponse(
+					retry.stopReason,
+					addAcpUsage(firstAttempt.usage, retry.usage),
+				);
 			}
 		}
 
-		return { stopReason: firstAttempt.stopReason };
+		return promptResponse(firstAttempt.stopReason, firstAttempt.usage);
 	}
 
 	async cancel(params: CancelNotification): Promise<void> {
@@ -930,7 +991,24 @@ export class CursorAcpAgent implements Agent {
 				configOptions: response.configOptions,
 			},
 		});
+		await this.emitContextUsage(session);
 		return response;
+	}
+
+	/** Sends `usage_update` when both the window size and an estimate of used tokens are known. */
+	private async emitContextUsage(session: SessionState): Promise<void> {
+		const size = contextWindowTokens(session.contextValue);
+		if (size === undefined || session.contextTokensUsed === undefined) {
+			return;
+		}
+		await this.emitOrQueueNotification(session, {
+			sessionId: session.sessionId,
+			update: {
+				sessionUpdate: "usage_update",
+				used: Math.min(session.contextTokensUsed, size),
+				size,
+			},
+		});
 	}
 
 	private async setSessionConfigOptionLocked(
@@ -1012,6 +1090,38 @@ export class CursorAcpAgent implements Agent {
 			session.configuredModelId = nextModelId;
 			session.thinkingLevel = value;
 			session.configuredThinkingLevel = value;
+			this.syncModelParameters(session);
+			await this.applyNativeModelIfConnected(session);
+			await this.persistSessionMeta(session);
+			return { configOptions: this.buildConfigOptions(session) };
+		}
+
+		if (configId === CONTEXT_PARAM_ID) {
+			if (session.activePrompt || session.activeRun) {
+				throw RequestError.invalidParams(
+					"Cannot change context window during an active prompt",
+				);
+			}
+			const parameterModel = findParameterModelInCatalog(
+				session.modelCatalog,
+				session.modelId,
+			);
+			if (!getContextParameterForModel(session.modelCatalog, session.modelId)) {
+				throw RequestError.invalidParams(
+					"Context window selection is not supported for the current model",
+				);
+			}
+			if (!isValidContextValue(parameterModel, value)) {
+				throw RequestError.invalidParams(`Invalid context window: ${value}`);
+			}
+			const nextModelId = applyContextValue(session.modelCatalog, session.modelId, value);
+			if (!nextModelId) {
+				throw RequestError.invalidParams(`No model variant for context window: ${value}`);
+			}
+			session.modelId = nextModelId;
+			session.configuredModelId = nextModelId;
+			session.contextValue = value;
+			session.configuredContextValue = value;
 			this.syncModelParameters(session);
 			await this.applyNativeModelIfConnected(session);
 			await this.persistSessionMeta(session);
@@ -1111,6 +1221,7 @@ export class CursorAcpAgent implements Agent {
 		preferredModelId?: string;
 		preferredThinkingLevel?: string;
 		preferredFastValue?: string;
+		preferredContextValue?: string;
 		preferredBackendSessionId?: string;
 		warmNativeBackend?: boolean;
 	}): Promise<ExtendedNewSessionResponse> {
@@ -1118,6 +1229,7 @@ export class CursorAcpAgent implements Agent {
 		const configuredModelId = params.preferredModelId ?? this.defaultModelId;
 		const configuredThinkingLevel = params.preferredThinkingLevel ?? this.defaultThinkingLevel;
 		const configuredFastValue = params.preferredFastValue ?? this.defaultFastValue;
+		const configuredContextValue = params.preferredContextValue ?? this.defaultContextValue;
 		const session: SessionState = {
 			sessionId: params.sessionId,
 			cwd: params.cwd,
@@ -1127,6 +1239,7 @@ export class CursorAcpAgent implements Agent {
 			configuredModelId,
 			configuredThinkingLevel,
 			configuredFastValue,
+			configuredContextValue,
 			lastAgentModeId: isAgentSessionMode(modeId) ? modeId : "auto-review",
 			cancelled: false,
 			nativeAvailableCommands: [],
@@ -1242,11 +1355,16 @@ export class CursorAcpAgent implements Agent {
 		return pickParameterValue(...fastCandidatesFrom(looseSessionDefaults(params)));
 	}
 
+	private extractRequestedInitialContext(params: NewSessionRequest): string | undefined {
+		return pickParameterValue(...contextCandidatesFrom(looseSessionDefaults(params)));
+	}
+
 	private extractInitializeDefaults(request: InitializeRequest): {
 		modeId?: SessionModeId;
 		modelId?: string;
 		thinkingLevel?: string;
 		fastValue?: string;
+		contextValue?: string;
 	} {
 		const raw = request as ExtendedInitializeRequest;
 
@@ -1266,6 +1384,10 @@ export class CursorAcpAgent implements Agent {
 			fastValue: pickParameterValue(
 				...fastCandidatesFrom(raw),
 				...fastCandidatesFrom(raw.clientCapabilities?._meta ?? {}),
+			),
+			contextValue: pickParameterValue(
+				...contextCandidatesFrom(raw),
+				...contextCandidatesFrom(raw.clientCapabilities?._meta ?? {}),
 			),
 		};
 	}
@@ -1735,6 +1857,25 @@ export class CursorAcpAgent implements Agent {
 					});
 				}
 			}
+
+			const contextParameter = getContextParameterForModel(
+				session.modelCatalog,
+				session.modelId,
+			);
+			if (contextParameter && session.contextValue) {
+				configOptions.push({
+					id: CONTEXT_PARAM_ID,
+					name: contextParameter.displayName ?? "Context",
+					description: "Maximum context window for the selected model",
+					category: "model_config",
+					type: "select",
+					currentValue: session.contextValue,
+					options: contextParameter.values.map((value) => ({
+						value: value.value,
+						name: value.displayName ?? value.value,
+					})),
+				});
+			}
 		}
 
 		return configOptions;
@@ -1744,6 +1885,14 @@ export class CursorAcpAgent implements Agent {
 		this.syncFastValueForModel(session);
 
 		let nextModelId = session.modelId;
+		if (session.configuredContextValue) {
+			nextModelId =
+				applyContextValue(
+					session.modelCatalog,
+					nextModelId,
+					session.configuredContextValue,
+				) ?? nextModelId;
+		}
 		if (session.configuredFastValue) {
 			nextModelId =
 				applyFastValue(session.modelCatalog, nextModelId, session.configuredFastValue) ??
@@ -1763,6 +1912,28 @@ export class CursorAcpAgent implements Agent {
 		}
 		this.syncFastValueForModel(session);
 		this.syncThinkingLevelForModel(session);
+		this.syncContextValueForModel(session);
+	}
+
+	private syncContextValueForModel(session: SessionState): void {
+		const parameterModel = findParameterModelInCatalog(session.modelCatalog, session.modelId);
+		if (!getContextParameterForModel(session.modelCatalog, session.modelId)) {
+			session.contextValue = undefined;
+			return;
+		}
+
+		const inferred = inferContextValueFromModelId(session.modelCatalog, session.modelId);
+		const resolved = isValidContextValue(parameterModel, session.configuredContextValue)
+			? session.configuredContextValue
+			: ((inferred && isValidContextValue(parameterModel, inferred) ? inferred : undefined) ??
+				resolveDefaultContextValue(parameterModel));
+		session.contextValue = resolved;
+		if (
+			session.configuredContextValue &&
+			!isValidContextValue(parameterModel, session.configuredContextValue)
+		) {
+			session.configuredContextValue = resolved;
+		}
 	}
 
 	private syncThinkingLevelForModel(session: SessionState): void {
@@ -1909,6 +2080,7 @@ export class CursorAcpAgent implements Agent {
 		const toolUseCache: Record<string, CachedToolUse> = {};
 		const modeSettings = this.modeToRunnerOptions(session, forceRetry);
 		const assistantTextChunks: string[] = [];
+		let usage: Usage | undefined;
 
 		await this.ensureLegacyBackendSessionId(session);
 
@@ -1923,8 +2095,20 @@ export class CursorAcpAgent implements Agent {
 			modelCatalog: session.modelCatalog,
 			thinkingLevel: session.thinkingLevel,
 			fastValue: session.fastValue,
+			contextValue: session.contextValue,
 			mcpServers: session.mcpServers,
 			onEvent: async (event) => {
+				const turnUsage = turnUsageFromEvent(event);
+				if (turnUsage) {
+					usage = addAcpUsage(usage, toAcpUsage(turnUsage.usage));
+					session.contextTokensUsed = estimateContextTokens(
+						turnUsage,
+						session.contextTokensUsed,
+					);
+					await this.emitContextUsage(session);
+					return;
+				}
+
 				const mapped = mapCursorEventToAcp(event, {
 					sessionId: session.sessionId,
 					toolUseCache,
@@ -1981,7 +2165,7 @@ export class CursorAcpAgent implements Agent {
 			const subtype = typeof resultEvent.subtype === "string" ? resultEvent.subtype : "";
 			const isError = resultEvent.is_error === true;
 			if (isError && subtype !== "transport_error" && rejectedToolCalls.length > 0) {
-				return { stopReason: "end_turn", rejectedToolCalls };
+				return { stopReason: "end_turn", rejectedToolCalls, usage };
 			}
 
 			if (subtype === "success" && !isError) {
@@ -1995,6 +2179,7 @@ export class CursorAcpAgent implements Agent {
 				return {
 					stopReason: "end_turn",
 					rejectedToolCalls,
+					usage,
 				};
 			}
 
@@ -2006,6 +2191,7 @@ export class CursorAcpAgent implements Agent {
 				return {
 					stopReason: "max_turn_requests",
 					rejectedToolCalls,
+					usage,
 				};
 			}
 
@@ -2295,6 +2481,7 @@ export class CursorAcpAgent implements Agent {
 			modelId: session.configuredModelId ?? session.modelId,
 			thinkingLevel: session.configuredThinkingLevel ?? session.thinkingLevel,
 			fastValue: session.configuredFastValue ?? session.fastValue,
+			contextValue: session.configuredContextValue ?? session.contextValue,
 		});
 	}
 

@@ -47,6 +47,15 @@ export function getEnvDefaultThinking(): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
+export function getEnvDefaultContext(): string | undefined {
+	const raw = process.env.CURSOR_ACP_DEFAULT_CONTEXT;
+	if (!raw) {
+		return undefined;
+	}
+	const trimmed = raw.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
 export function normalizeModeId(value: string): SessionModeId | null {
 	if (ADVERTISED_MODE_IDS.includes(value as AdvertisedModeId)) {
 		return value as AdvertisedModeId;

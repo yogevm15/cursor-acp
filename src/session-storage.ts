@@ -32,6 +32,7 @@ export interface SessionMetaEntry {
 	modelId?: string;
 	thinkingLevel?: string;
 	fastValue?: string;
+	contextValue?: string;
 }
 
 interface SessionListEntry {
@@ -96,6 +97,7 @@ export async function recordSessionMeta(
 		modelId?: string;
 		thinkingLevel?: string;
 		fastValue?: string;
+		contextValue?: string;
 	},
 ): Promise<void> {
 	const entry: SessionMetaEntry = {
@@ -108,6 +110,7 @@ export async function recordSessionMeta(
 		modelId: meta.modelId,
 		thinkingLevel: meta.thinkingLevel,
 		fastValue: meta.fastValue,
+		contextValue: meta.contextValue,
 	};
 	await ensureSessionDir(cwd);
 	const filePath = sessionFilePath(cwd, sessionId);
@@ -124,6 +127,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 	modelId?: string;
 	thinkingLevel?: string;
 	fastValue?: string;
+	contextValue?: string;
 }> {
 	try {
 		const content = await fs.promises.readFile(filePath, "utf-8");
@@ -133,6 +137,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 		let lastModelId: string | undefined;
 		let lastThinkingLevel: string | undefined;
 		let lastFastValue: string | undefined;
+		let lastContextValue: string | undefined;
 		for (const line of lines) {
 			try {
 				const entry = JSON.parse(line) as {
@@ -142,6 +147,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 					modelId?: string;
 					thinkingLevel?: string;
 					fastValue?: string;
+					contextValue?: string;
 				};
 				if (entry.type !== "session_meta") {
 					continue;
@@ -164,6 +170,9 @@ export async function readSessionMeta(filePath: string): Promise<{
 				if (typeof entry.fastValue === "string" && entry.fastValue.trim()) {
 					lastFastValue = entry.fastValue.trim();
 				}
+				if (typeof entry.contextValue === "string" && entry.contextValue.trim()) {
+					lastContextValue = entry.contextValue.trim();
+				}
 			} catch {
 				continue;
 			}
@@ -174,6 +183,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			modelId: lastModelId,
 			thinkingLevel: lastThinkingLevel,
 			fastValue: lastFastValue,
+			contextValue: lastContextValue,
 		};
 	} catch {
 		// file not readable

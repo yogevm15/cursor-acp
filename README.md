@@ -20,7 +20,8 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - **ACP permission fallback**: A call stopped by Auto Review is surfaced to the client. “Allow once” retries that turn with Auto Review disabled; “Always allow” switches the session to Yolo.
 - **Correct SDK mode lifecycle**: Auto Review is an agent-level SDK option. Switching review policy closes and resumes the same SDK agent with the new policy; the SDK's unrelated crash-recovery `force` flag is never used as an approval bypass.
 - **Stable prompt lifecycle**: Standalone Cursor transport diagnostics fail the ACP turn instead of being treated as successful replies. Cancellation drains final SDK events and retires an unresponsive agent after a bounded wait.
-- **Model parameters**: Canonical SDK model IDs, thinking/reasoning/effort levels, fast values, and variants flow into SDK model selections. The adapter keeps the catalog's original parameter ids.
+- **Model parameters**: Canonical SDK model IDs, thinking/reasoning/effort levels, fast values, context window sizes, and variants flow into SDK model selections. The adapter keeps the catalog's original parameter ids.
+- **Context window and token usage**: Models with an SDK `context` parameter (for example `272k` / `1m`) get a **Context** selector. After each turn, the adapter returns the turn's token counts in the ACP prompt response (`usage`) and sends a `usage_update` with the tokens in context and the window size.
 - **MCP and images**: ACP-provided stdio/HTTP/SSE MCP servers and image chunks are forwarded to the SDK.
 - **Agent, Plan, and Ask**: Plan uses the SDK's `plan` send mode. Ask creates a no-tools SDK agent.
 
@@ -41,6 +42,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - The SDK exposes no interactive per-tool approval callback. ACP approval therefore retries the complete turn without Auto Review; work completed before the blocked call may be repeated.
 - Auto Review reduces confirmation noise but is not a security boundary. Use sandboxing and normal least-privilege practices for untrusted workspaces.
 - `debug` mode is not exposed.
+- Context usage is an estimate. The SDK reports one token sum for all model calls in a turn, so for turns with tool calls the adapter estimates the size of the last call. `usage_update` is sent only for models that advertise a `context` parameter, because the SDK does not report the window size of other models.
 
 ## Breaking changes (SDK backend and Auto Review default)
 
@@ -193,7 +195,8 @@ Zed versions with ACP config defaults apply initial controls from `default_confi
         "mode": "auto-review",
         "model": "composer-2.5",
         "fast": false,
-        "thinking": "high"
+        "thinking": "high",
+        "context": "1m"
       }
     }
   }
@@ -204,10 +207,11 @@ Zed versions with ACP config defaults apply initial controls from `default_confi
 - `model` — optional canonical model ID from the Cursor SDK catalog.
 - `fast` — boolean toggle when the selected model advertises a `fast` parameter.
 - `thinking` — ACP config id for the selected model's `thinking`, `reasoning`, or `effort` parameter. For on/off parameters, use `true` or `false`. Multi-level parameters use catalog values (for example `none` / `low` / `medium` / `high` / `xhigh` / `max`, or Effort `low` / `high`). The picker label also comes from the SDK catalog.
+- `context` — maximum context window, when the selected model advertises a `context` parameter. Use a catalog value such as `200k`, `272k`, `300k`, or `1m`. Values the model does not offer fall back to the model default.
 
-Legacy Zed fields (`default_mode`, `default_model`, `default_fast`, and `default_thinking`) remain accepted for compatibility. There is no adapter-specific config file. Environment fallbacks are `CURSOR_ACP_DEFAULT_MODE`, `CURSOR_ACP_DEFAULT_MODEL`, and `CURSOR_ACP_DEFAULT_THINKING`.
+Legacy Zed fields (`default_mode`, `default_model`, `default_fast`, `default_thinking`, and `default_context`) remain accepted for compatibility. There is no adapter-specific config file. Environment fallbacks are `CURSOR_ACP_DEFAULT_MODE`, `CURSOR_ACP_DEFAULT_MODEL`, `CURSOR_ACP_DEFAULT_THINKING`, and `CURSOR_ACP_DEFAULT_CONTEXT`.
 
-The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-specific **Fast** and **Thinking** controls appear when the SDK catalog advertises `fast`, `thinking`, `reasoning`, or `effort` parameters. The ACP config id stays `thinking` even when the SDK parameter is `reasoning` or `effort`; the picker label follows the catalog (for example **Effort**). Clients that advertise boolean config support receive parameters offering exactly `true` and `false` as toggles. Other clients receive select controls, and multi-level reasoning parameters remain selectors on all clients.
+The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-specific **Fast** and **Thinking** controls appear when the SDK catalog advertises `fast`, `thinking`, `reasoning`, or `effort` parameters. The ACP config id stays `thinking` even when the SDK parameter is `reasoning` or `effort`; the picker label follows the catalog (for example **Effort**). Clients that advertise boolean config support receive parameters offering exactly `true` and `false` as toggles. Other clients receive select controls, and multi-level reasoning parameters remain selectors on all clients. A **Context** selector appears when the SDK catalog advertises a `context` parameter for the selected model.
 
 ### Using in Zed
 
@@ -277,7 +281,8 @@ src/
 ├── cursor-acp-agent.ts   # ACP lifecycle, persistence, and permissions
 ├── cursor-runner.ts      # Prompt execution interface
 ├── cursor-sdk-runner.ts  # Cursor SDK implementation
-├── model-id.ts           # SDK model ids, thinking/reasoning/effort, and fast variants
+├── model-id.ts           # SDK model ids, thinking/reasoning/effort, fast, and context variants
+├── context-usage.ts      # Turn token usage and context window estimates
 ├── cursor-cli-config.ts  # Global CLI attribution and config paths
 ├── cursor-sdk-event-adapter.ts # SDK-to-ACP event compatibility
 ├── prompt-conversion.ts  # ACP text, context, and image conversion

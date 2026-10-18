@@ -25,6 +25,7 @@ export interface RunPromptOptions {
 	modelCatalog?: CursorModelDescriptor[];
 	thinkingLevel?: string;
 	fastValue?: string;
+	contextValue?: string;
 	mcpServers?: McpServer[];
 	onEvent?: (event: CursorStreamEvent) => Promise<void> | void;
 }

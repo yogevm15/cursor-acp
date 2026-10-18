@@ -256,6 +256,7 @@ function createAgentTestHarness(
 		reviewPolicy?: RunPromptOptions["reviewPolicy"];
 		thinkingLevel?: string;
 		fastValue?: string;
+		contextValue?: string;
 	}[] = [];
 
 	const runner: TestCliRunner = {
@@ -280,6 +281,7 @@ function createAgentTestHarness(
 				reviewPolicy: options.reviewPolicy,
 				thinkingLevel: options.thinkingLevel,
 				fastValue: options.fastValue,
+				contextValue: options.contextValue,
 			});
 			const completed = (async () => {
 				if (legacyPromptHandler) {
@@ -1313,6 +1315,109 @@ describe("CursorAcpAgent", () => {
 			type: "boolean",
 			currentValue: false,
 		});
+	});
+
+	it("exposes a context window selector and reports context usage", async () => {
+		const { agent, client, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness(
+			{
+				models: [
+					{
+						modelId: "claude-opus-5-5",
+						name: "Opus 5.5",
+						current: true,
+						parameters: [
+							{
+								id: "context",
+								displayName: "Context",
+								values: [{ value: "300k" }, { value: "1m" }],
+							},
+						],
+						variants: [{ params: [{ id: "context", value: "300k" }], isDefault: true }],
+					},
+				],
+			},
+		);
+		await agent.initialize(initRequest({ clientCapabilities: {} }));
+		const session = await agent.newSession(
+			newSessionRequest({
+				cwd: "/tmp",
+				mcpServers: [],
+				default_config_options: { model: "claude-opus-5-5" },
+			}),
+		);
+
+		expect(session.configOptions?.find((option) => option.id === "context")).toMatchObject({
+			type: "select",
+			name: "Context",
+			category: "model_config",
+			currentValue: "300k",
+		});
+
+		setLegacyPromptHandler(async (_promptText, options) => {
+			await options.onEvent?.({
+				type: "usage",
+				usage: {
+					inputTokens: 20_000,
+					outputTokens: 400,
+					cacheReadTokens: 15_000,
+					cacheWriteTokens: 0,
+					totalTokens: 35_400,
+				},
+				model_calls: 1,
+			});
+			return {
+				events: [],
+				resultEvent: { type: "result", subtype: "success", is_error: false },
+				stderr: "",
+				exitCode: 0,
+			};
+		});
+		client.updates.length = 0;
+		const response = await agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "hello" }],
+		});
+
+		expect(legacyPromptCalls[0]?.contextValue).toBe("300k");
+		expect(response.usage).toEqual({
+			totalTokens: 35_400,
+			inputTokens: 20_000,
+			outputTokens: 400,
+			cachedReadTokens: 15_000,
+			cachedWriteTokens: 0,
+		});
+		expect(
+			client.updates.find((update) => update.update.sessionUpdate === "usage_update")?.update,
+		).toEqual({ sessionUpdate: "usage_update", used: 20_400, size: 300_000 });
+
+		client.updates.length = 0;
+		const contextResponse = await agent.setSessionConfigOption({
+			sessionId: session.sessionId,
+			configId: "context",
+			value: "1m",
+		});
+		expect(
+			contextResponse.configOptions.find((option) => option.id === "context"),
+		).toMatchObject({ currentValue: "1m" });
+		expect(client.updates.map((update) => update.update.sessionUpdate)).toEqual([
+			"config_option_update",
+			"usage_update",
+		]);
+		expect(client.updates[1]?.update).toMatchObject({ used: 20_400, size: 1_000_000 });
+
+		await agent.prompt({
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "again" }],
+		});
+		expect(legacyPromptCalls[1]?.contextValue).toBe("1m");
+
+		await expect(
+			agent.setSessionConfigOption({
+				sessionId: session.sessionId,
+				configId: "context",
+				value: "2m",
+			}),
+		).rejects.toThrow();
 	});
 
 	it("exposes boolean thinking and fast parameters as toggles and applies their values", async () => {
