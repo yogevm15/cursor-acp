@@ -7,6 +7,7 @@ import type {
 
 export const THINKING_PARAM_ID = "thinking";
 export const FAST_PARAM_ID = "fast";
+export const CONTEXT_PARAM_ID = "context";
 
 const THINKING_PARAM_IDS = [THINKING_PARAM_ID, "reasoning", "effort"];
 
@@ -161,6 +162,7 @@ export function buildSdkModelSelection(
 	modelCatalog?: CursorModelDescriptor[],
 	thinkingLevel?: string,
 	fastValue?: string,
+	contextValue?: string,
 ): ModelSelection {
 	const normalizedModelId = normalizeModelId(modelId);
 	if (normalizedModelId === "auto") {
@@ -175,6 +177,9 @@ export function buildSdkModelSelection(
 	}
 	if (isValidFastValue(parameterModel, fastValue)) {
 		params.push({ id: FAST_PARAM_ID, value: fastValue! });
+	}
+	if (isValidContextValue(parameterModel, contextValue)) {
+		params.push({ id: CONTEXT_PARAM_ID, value: contextValue! });
 	}
 
 	return {
@@ -420,7 +425,11 @@ function modelGroupId(modelId: string): string {
 }
 
 function parameterMetadataScore(model: CursorModelDescriptor | undefined): number {
-	return Number(Boolean(getFastParameter(model))) + Number(Boolean(getThinkingParameter(model)));
+	return (
+		Number(Boolean(getFastParameter(model))) +
+		Number(Boolean(getThinkingParameter(model))) +
+		Number(Boolean(getContextParameter(model)))
+	);
 }
 
 /** Resolve parameter metadata from a model group, not only the exact selected variant. */
@@ -870,4 +879,90 @@ export function applyThinkingValue(
 	return findVariantByParams(withCliModelParameters(modelCatalog), modelId, {
 		[THINKING_PARAM_ID]: thinkingValue,
 	});
+}
+
+export function getContextParameter(
+	model: CursorModelDescriptor | undefined,
+): ModelParameterDescriptor | undefined {
+	const parameter = model?.parameters?.find((entry) => entry.id === CONTEXT_PARAM_ID);
+	return parameter && parameter.values.length > 0 ? parameter : undefined;
+}
+
+/** Context window selector metadata for a selected model, from the SDK `context` parameter. */
+export function getContextParameterForModel(
+	modelCatalog: CursorModelDescriptor[] | undefined,
+	modelId: string | undefined,
+): ModelParameterDescriptor | undefined {
+	return getContextParameter(findParameterModelInCatalog(modelCatalog, modelId));
+}
+
+export function inferContextValueFromModelId(
+	modelCatalog: CursorModelDescriptor[] | undefined,
+	modelId: string | undefined,
+): string | undefined {
+	return inferParameterValueFromModelId(modelCatalog, modelId, CONTEXT_PARAM_ID);
+}
+
+export function isValidContextValue(
+	model: CursorModelDescriptor | undefined,
+	contextValue: string | undefined,
+): boolean {
+	if (!contextValue) {
+		return false;
+	}
+
+	return (
+		getContextParameter(model)?.values.some((value) => value.value === contextValue) ?? false
+	);
+}
+
+export function resolveDefaultContextValue(
+	model: CursorModelDescriptor | undefined,
+): string | undefined {
+	const contextParameter = getContextParameter(model);
+	if (!contextParameter) {
+		return undefined;
+	}
+
+	const defaultVariant = model?.variants?.find((variant) => variant.isDefault);
+	const variantContext = variantParamValue(defaultVariant, CONTEXT_PARAM_ID);
+	if (variantContext && isValidContextValue(model, variantContext)) {
+		return variantContext;
+	}
+
+	return contextParameter.values[0]?.value;
+}
+
+export function applyContextValue(
+	modelCatalog: CursorModelDescriptor[] | undefined,
+	modelId: string | undefined,
+	contextValue: string,
+): string | undefined {
+	if (!modelCatalog || !modelId) {
+		return undefined;
+	}
+	const parameterModel = findParameterModelInCatalog(modelCatalog, modelId);
+	if (!isValidContextValue(parameterModel, contextValue)) {
+		return undefined;
+	}
+	const descriptorVariant = findVariantByDescriptorParams(modelCatalog, modelId, {
+		[CONTEXT_PARAM_ID]: contextValue,
+	});
+	if (descriptorVariant) {
+		return descriptorVariant;
+	}
+
+	return parameterModel?.modelId;
+}
+
+/** Token count for SDK context values such as `272k` or `1m`. */
+export function contextWindowTokens(contextValue: string | undefined): number | undefined {
+	const match = contextValue?.trim().match(/^(\d+(?:\.\d+)?)\s*([km])?$/i);
+	if (!match?.[1]) {
+		return undefined;
+	}
+
+	const multiplier =
+		match[2]?.toLowerCase() === "m" ? 1_000_000 : match[2]?.toLowerCase() === "k" ? 1_000 : 1;
+	return Math.round(Number(match[1]) * multiplier);
 }

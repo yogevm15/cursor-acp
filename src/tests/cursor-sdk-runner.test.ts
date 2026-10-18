@@ -201,6 +201,56 @@ describe("CursorSdkRunner", () => {
 		expect(events.filter((event) => event.subtype === "started")).toHaveLength(1);
 	});
 
+	it("emits turn usage with the number of model calls", async () => {
+		const usage = {
+			inputTokens: 16_000,
+			outputTokens: 90,
+			cacheReadTokens: 11_000,
+			cacheWriteTokens: 0,
+			totalTokens: 27_090,
+		};
+		const agent = {
+			...sdkAgent("agent-real"),
+			send: vi.fn(async (_message: unknown, options: unknown) => {
+				const { onDelta } = options as {
+					onDelta: (args: { update: Record<string, unknown> }) => void;
+				};
+				for (const modelCallId of ["call-a", "call-a", "call-b"]) {
+					onDelta({ update: { type: "tool-call-started", callId: "c", modelCallId } });
+				}
+				return sdkRun([{ type: "usage", agent_id: "agent-real", run_id: "r", usage }]);
+			}),
+		};
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+		const events: CursorStreamEvent[] = [];
+
+		await runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "hello",
+			modelId: "gpt-5.6-sol",
+			contextValue: "1m",
+			modelCatalog: [
+				{
+					modelId: "gpt-5.6-sol",
+					name: "GPT-5.6 Sol",
+					parameters: [{ id: "context", values: [{ value: "272k" }, { value: "1m" }] }],
+				},
+			],
+			onEvent: (event) => {
+				events.push(event);
+			},
+		}).completed;
+
+		expect(agent.send).toHaveBeenCalledWith(
+			"hello",
+			expect.objectContaining({
+				model: { id: "gpt-5.6-sol", params: [{ id: "context", value: "1m" }] },
+			}),
+		);
+		expect(events).toContainEqual({ type: "usage", usage, model_calls: 3 });
+	});
+
 	it("treats a standalone Cursor transport diagnostic as a failed run", async () => {
 		const diagnostic = "Error: RetriableError: WritableIterable is closed";
 		const agent = sdkAgent("agent-real", [

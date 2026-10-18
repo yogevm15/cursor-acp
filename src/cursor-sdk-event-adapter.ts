@@ -1,4 +1,4 @@
-import type { SDKMessage } from "@cursor/sdk";
+import type { SDKMessage, TokenUsage } from "@cursor/sdk";
 import type { CursorStreamEvent } from "./cursor-runner.js";
 import { isObject } from "./utils.js";
 
@@ -96,6 +96,13 @@ export function sdkMessageToCursorStreamEvent(message: SDKMessage): CursorStream
 		default:
 			return [];
 	}
+}
+
+export function sdkUsageToCursorUsageEvent(
+	usage: TokenUsage,
+	modelCalls: number,
+): CursorStreamEvent {
+	return { type: "usage", usage, model_calls: modelCalls };
 }
 
 export function sdkRunResultToCursorResultEvent(args: {
