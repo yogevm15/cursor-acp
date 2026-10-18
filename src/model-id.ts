@@ -9,7 +9,7 @@ export const THINKING_PARAM_ID = "thinking";
 export const FAST_PARAM_ID = "fast";
 export const CONTEXT_PARAM_ID = "context";
 
-const THINKING_PARAM_IDS = [THINKING_PARAM_ID, "reasoning", "effort"];
+const THINKING_PARAM_IDS = [THINKING_PARAM_ID, "reasoning_effort", "reasoning", "effort"];
 
 const AUTO_MODEL: CursorModelDescriptor = {
 	modelId: "auto",
@@ -81,7 +81,7 @@ function parseLegacyModelId(modelId: string): ParsedLegacyModelId | null {
 			continue;
 		}
 
-		if (key === THINKING_PARAM_ID || key === "reasoning" || key === "effort") {
+		if (THINKING_PARAM_IDS.includes(key)) {
 			parsed.thinking = value;
 			continue;
 		}
@@ -180,6 +180,14 @@ export function buildSdkModelSelection(
 	}
 	if (isValidContextValue(parameterModel, contextValue)) {
 		params.push({ id: CONTEXT_PARAM_ID, value: contextValue! });
+	}
+	const thinkingSwitchValue = companionThinkingSwitchValue(
+		parameterModel,
+		thinkingParameter,
+		params,
+	);
+	if (thinkingSwitchValue) {
+		params.push({ id: THINKING_PARAM_ID, value: thinkingSwitchValue });
 	}
 
 	return {
@@ -663,17 +671,62 @@ export function inferThinkingValueFromModelId(
 		: undefined;
 }
 
-/** First catalog parameter named `thinking`, `reasoning`, or `effort` that has values. */
+function isBooleanParameter(parameter: ModelParameterDescriptor): boolean {
+	return (
+		parameter.values.length === 2 &&
+		parameter.values.every((value) => value.value === "true" || value.value === "false")
+	);
+}
+
+/**
+ * The catalog parameter behind the ACP `thinking` control. A multi-level parameter
+ * (`reasoning_effort`, `reasoning`, `effort`, or leveled `thinking`) wins over an on/off
+ * `thinking` parameter, because Claude models list both.
+ */
 export function getThinkingParameter(
 	model: CursorModelDescriptor | undefined,
 ): ModelParameterDescriptor | undefined {
-	for (const parameterId of THINKING_PARAM_IDS) {
-		const parameter = model?.parameters?.find((entry) => entry.id === parameterId);
-		if (parameter?.values.length) {
-			return parameter;
-		}
+	const candidates = THINKING_PARAM_IDS.map((parameterId) =>
+		model?.parameters?.find((entry) => entry.id === parameterId),
+	).filter((parameter): parameter is ModelParameterDescriptor =>
+		Boolean(parameter?.values.length),
+	);
+	return candidates.find((parameter) => !isBooleanParameter(parameter)) ?? candidates[0];
+}
+
+/**
+ * When the `thinking` control drives an effort parameter, the model can also have an on/off
+ * `thinking` parameter. Pick the value of a real variant that matches the other params,
+ * preferring the default variant, so the SDK selection is not ambiguous.
+ */
+function companionThinkingSwitchValue(
+	model: CursorModelDescriptor | undefined,
+	thinkingParameter: ModelParameterDescriptor | undefined,
+	params: Array<{ id: string; value: string }>,
+): string | undefined {
+	const thinkingSwitch = model?.parameters?.find((entry) => entry.id === THINKING_PARAM_ID);
+	if (
+		!thinkingSwitch ||
+		thinkingSwitch === thinkingParameter ||
+		!isBooleanParameter(thinkingSwitch)
+	) {
+		return undefined;
 	}
-	return undefined;
+
+	const matches = (model?.variants ?? []).filter((variant) =>
+		params.every((param) => variantParamValue(variant, param.id) === param.value),
+	);
+	const switchValues = matches
+		.map((variant) => variantParamValue(variant, THINKING_PARAM_ID))
+		.filter((value): value is string => value === "true" || value === "false");
+	const defaultValue = variantParamValue(
+		model?.variants?.find((variant) => variant.isDefault),
+		THINKING_PARAM_ID,
+	);
+	if (defaultValue && switchValues.includes(defaultValue)) {
+		return defaultValue;
+	}
+	return switchValues.includes("true") ? "true" : switchValues[0];
 }
 
 export function getFastParameter(

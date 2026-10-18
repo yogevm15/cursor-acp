@@ -5,6 +5,7 @@ import {
 	buildSdkModelSelection,
 	contextWindowTokens,
 	getFastParameterForModel,
+	getThinkingParameter,
 	inferFastValueFromModelId,
 	mergeModelCatalogs,
 	modelRequiresMaxMode,
@@ -200,6 +201,78 @@ describe("model id normalization", () => {
 		expect(contextWindowTokens("200000")).toBe(200_000);
 		expect(contextWindowTokens("max")).toBeUndefined();
 		expect(contextWindowTokens(undefined)).toBeUndefined();
+	});
+});
+
+describe("thinking parameter selection", () => {
+	const claude = {
+		modelId: "claude-opus-5",
+		name: "Opus 5",
+		parameters: [
+			{ id: "thinking", values: [{ value: "false" }, { value: "true" }] },
+			{ id: "effort", values: [{ value: "low" }, { value: "max" }] },
+		],
+		variants: [
+			{
+				params: [
+					{ id: "thinking", value: "false" },
+					{ id: "effort", value: "low" },
+				],
+			},
+			{
+				params: [
+					{ id: "thinking", value: "true" },
+					{ id: "effort", value: "low" },
+				],
+				isDefault: true,
+			},
+			{
+				params: [
+					{ id: "thinking", value: "true" },
+					{ id: "effort", value: "max" },
+				],
+			},
+		],
+	};
+
+	it("prefers a multi-level effort parameter over an on/off thinking parameter", () => {
+		expect(getThinkingParameter(claude)?.id).toBe("effort");
+	});
+
+	it("recognizes reasoning_effort", () => {
+		expect(
+			getThinkingParameter({
+				modelId: "grok",
+				name: "Grok",
+				parameters: [
+					{ id: "reasoning_effort", values: [{ value: "low" }, { value: "high" }] },
+				],
+			})?.id,
+		).toBe("reasoning_effort");
+	});
+
+	it("keeps an on/off thinking parameter when it is the only one", () => {
+		expect(
+			getThinkingParameter({
+				modelId: "claude-haiku-4-5",
+				name: "Haiku",
+				parameters: [{ id: "thinking", values: [{ value: "false" }, { value: "true" }] }],
+			})?.id,
+		).toBe("thinking");
+	});
+
+	it("sends the default thinking switch value with the selected effort", () => {
+		expect(buildSdkModelSelection("claude-opus-5", [claude], "low")).toEqual({
+			id: "claude-opus-5",
+			params: [
+				{ id: "effort", value: "low" },
+				{ id: "thinking", value: "true" },
+			],
+		});
+		expect(buildSdkModelSelection("claude-opus-5", [claude], "max").params).toContainEqual({
+			id: "thinking",
+			value: "true",
+		});
 	});
 });
 
