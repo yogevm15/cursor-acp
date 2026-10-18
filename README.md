@@ -211,7 +211,18 @@ Zed versions with ACP config defaults apply initial controls from `default_confi
 
 Legacy Zed fields (`default_mode`, `default_model`, `default_fast`, `default_thinking`, and `default_context`) remain accepted for compatibility. There is no adapter-specific config file. Environment fallbacks are `CURSOR_ACP_DEFAULT_MODE`, `CURSOR_ACP_DEFAULT_MODEL`, `CURSOR_ACP_DEFAULT_THINKING`, and `CURSOR_ACP_DEFAULT_CONTEXT`.
 
-The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-specific **Fast** and **Thinking** controls appear when the SDK catalog advertises `fast`, `thinking`, `reasoning`, or `effort` parameters. The ACP config id stays `thinking` even when the SDK parameter is `reasoning` or `effort`; the picker label follows the catalog (for example **Effort**). Clients that advertise boolean config support receive parameters offering exactly `true` and `false` as toggles. Other clients receive select controls, and multi-level reasoning parameters remain selectors on all clients. A **Context** selector appears when the SDK catalog advertises a `context` parameter for the selected model.
+The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-specific **Fast** and **Thinking** controls appear when the SDK catalog advertises `fast`, `thinking`, `reasoning`, or `effort` parameters. The ACP config id stays `thinking` even when the SDK parameter is `reasoning` or `effort`; the picker label follows the catalog (for example **Effort**). Clients that advertise boolean config support receive parameters offering exactly `true` and `false` as toggles. Other clients receive select controls, and multi-level reasoning parameters remain selectors on all clients. A **Context** selector appears when the SDK catalog advertises a `context` parameter for the selected model. Models and parameter values that run only in Max Mode show a **(Max Mode)** label.
+
+### Prompts during a running turn
+
+When you send a prompt while a turn is running, the adapter adds the text to the running turn (Cursor SDK steering). If the running turn cannot take the text, for example because the prompt has images, the prompt waits and runs as the next turn. `session/cancel` also cancels waiting prompts. Set `CURSOR_ACP_STEERING=0` to reject prompts during a running turn instead.
+
+### Client capabilities
+
+- **Notices** — clients that advertise `clientCapabilities.session.notices` receive `notice` updates for warnings such as a missing saved session, an Auto-review stop, or a backend restart.
+- **Subagents** — clients that advertise `clientCapabilities.subagents` receive `subagent_update` and `session_message` updates for Cursor `task` tool calls. The tool call itself still appears in the parent session.
+
+The adapter accepts a `session/new` or `session/load` request without `mcpServers`, and it ignores malformed `mcpServers` entries. The maximum size of one incoming ACP message is 256 MiB. Set `CURSOR_ACP_MAX_MESSAGE_BYTES` to change it.
 
 ### Using in Zed
 

@@ -109,6 +109,10 @@ export function sanitizeToolCallId(raw: string): string {
 	return trimmed.replace(/\s+/g, "_");
 }
 
+export function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 export function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }

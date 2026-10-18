@@ -7,9 +7,12 @@ import {
 	getFastParameterForModel,
 	inferFastValueFromModelId,
 	mergeModelCatalogs,
+	modelRequiresMaxMode,
 	normalizeModelId,
+	parameterValueRequiresMaxMode,
 	resolveModelId,
 	withCliModelParameters,
+	withMaxModeLabel,
 } from "../model-id.js";
 
 describe("model id normalization", () => {
@@ -197,5 +200,48 @@ describe("model id normalization", () => {
 		expect(contextWindowTokens("200000")).toBe(200_000);
 		expect(contextWindowTokens("max")).toBeUndefined();
 		expect(contextWindowTokens(undefined)).toBeUndefined();
+	});
+});
+
+describe("Max Mode metadata", () => {
+	const catalog = [
+		{
+			modelId: "claude-opus",
+			name: "Opus",
+			parameters: [
+				{
+					id: "context",
+					values: [{ value: "200k" }, { value: "1m" }],
+				},
+			],
+			variants: [
+				{ params: [{ id: "context", value: "200k" }], isDefault: true },
+				{ params: [{ id: "context", value: "1m" }], isMaxMode: true },
+			],
+		},
+		{
+			modelId: "max-only",
+			name: "Max only",
+			variants: [{ params: [], isMaxMode: true }],
+		},
+	];
+
+	it("marks parameter values whose variants all need Max Mode", () => {
+		expect(parameterValueRequiresMaxMode(catalog, "claude-opus", "context", "1m")).toBe(true);
+		expect(parameterValueRequiresMaxMode(catalog, "claude-opus", "context", "200k")).toBe(
+			false,
+		);
+		expect(parameterValueRequiresMaxMode(catalog, "claude-opus", "context", "5m")).toBe(false);
+	});
+
+	it("marks models whose variants all need Max Mode", () => {
+		expect(modelRequiresMaxMode(catalog, "max-only")).toBe(true);
+		expect(modelRequiresMaxMode(catalog, "claude-opus")).toBe(false);
+		expect(modelRequiresMaxMode(catalog, "unknown")).toBe(false);
+	});
+
+	it("adds a label only when Max Mode is required", () => {
+		expect(withMaxModeLabel("1M", true)).toBe("1M (Max Mode)");
+		expect(withMaxModeLabel("200K", false)).toBe("200K");
 	});
 });

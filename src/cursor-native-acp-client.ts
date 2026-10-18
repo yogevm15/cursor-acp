@@ -18,6 +18,7 @@ import {
 	ndJsonStream,
 } from "@agentclientprotocol/sdk";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { getAcpMaxMessageBytes, withLenientClientRequests } from "./acp-wire-compat.js";
 import { getDefaultCursorAgentCommand } from "./cursor-agent-command.js";
 import type {
 	ExtendedLoadSessionResponse,
@@ -290,9 +291,10 @@ export class CursorNativeAcpClient implements NativeSessionBackend {
 			}
 		});
 
-		const stream = ndJsonStream(
-			nodeToWebWritable(child.stdin),
-			nodeToWebReadable(child.stdout),
+		const stream = withLenientClientRequests(
+			ndJsonStream(nodeToWebWritable(child.stdin), nodeToWebReadable(child.stdout), {
+				maxMessageBytes: getAcpMaxMessageBytes(),
+			}),
 		);
 		const connection = new ClientSideConnection(
 			() => new NativeClientHandler(this.callbacks, this.options.logger ?? console),

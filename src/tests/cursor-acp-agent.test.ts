@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
+	ClientCapabilities,
 	PromptResponse,
 	RequestPermissionRequest,
 	RequestPermissionResponse,
@@ -21,6 +22,7 @@ import {
 import { CursorAcpAgent } from "../cursor-acp-agent.js";
 import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { RunPromptOptions } from "../cursor-cli-runner.js";
+import type { SteerOutcome } from "../cursor-runner.js";
 import { recordAssistantMessage, recordUserMessage } from "../session-storage.js";
 import type { CursorModelDescriptor } from "../slash-commands.js";
 import {
@@ -250,6 +252,7 @@ function createAgentTestHarness(
 	const backends: FakeNativeBackend[] = [];
 	const client = new FakeClient();
 	let legacyPromptHandler: LegacyPromptHandler | undefined;
+	let steerHandler: ((text: string) => Promise<SteerOutcome>) | undefined;
 	const legacyPromptCalls: {
 		promptText: string;
 		backendSessionId?: string;
@@ -301,6 +304,7 @@ function createAgentTestHarness(
 			return {
 				completed,
 				cancel() {},
+				...(steerHandler ? { steer: steerHandler } : {}),
 			};
 		},
 	};
@@ -340,6 +344,9 @@ function createAgentTestHarness(
 		legacyPromptCalls,
 		setLegacyPromptHandler(handler: LegacyPromptHandler) {
 			legacyPromptHandler = handler;
+		},
+		setSteerHandler(handler: (text: string) => Promise<SteerOutcome>) {
+			steerHandler = handler;
 		},
 	};
 }
@@ -2486,53 +2493,153 @@ describe("CursorAcpAgent", () => {
 		expect(started?.update?._meta?.terminal_info).toBeUndefined();
 	});
 
-	it("rejects a second prompt while one is in progress", async () => {
-		const { agent, legacyPromptCalls, setLegacyPromptHandler } = createAgentTestHarness();
-
-		await agent.initialize(
-			initRequest({
-				protocolVersion: 1,
-				clientCapabilities: {},
-			}),
-		);
-		const session = await agent.newSession(
-			newSessionRequest({
-				cwd: "/tmp",
-				mcpServers: [],
-			}),
-		);
-
-		let resolvePrompt: (() => void) | undefined;
-		setLegacyPromptHandler(
-			async () =>
-				await new Promise((resolve) => {
-					resolvePrompt = () =>
-						resolve({
-							events: [],
-							resultEvent: { type: "result", subtype: "success", is_error: false },
-							stderr: "",
-							exitCode: 0,
-						});
+	describe("prompts during a running turn", () => {
+		async function startBlockedTurn(
+			options: {
+				clientCapabilities?: ClientCapabilities;
+				steer?: (text: string) => Promise<SteerOutcome>;
+			} = {},
+		) {
+			const harness = createAgentTestHarness();
+			if (options.steer) {
+				harness.setSteerHandler(options.steer);
+			}
+			await harness.agent.initialize(
+				initRequest({
+					protocolVersion: 1,
+					clientCapabilities: options.clientCapabilities ?? {},
 				}),
-		);
+			);
+			const session = await harness.agent.newSession(
+				newSessionRequest({ cwd: "/tmp", mcpServers: [] }),
+			);
 
-		const first = agent.prompt({
-			sessionId: session.sessionId,
-			prompt: [{ type: "text", text: "run something" }],
-		});
-		while (legacyPromptCalls.length === 0) {
-			await new Promise((resolve) => setTimeout(resolve, 0));
+			const releases: Array<() => void> = [];
+			harness.setLegacyPromptHandler(
+				async () =>
+					await new Promise((resolve) => {
+						releases.push(() =>
+							resolve({
+								events: [],
+								resultEvent: {
+									type: "result",
+									subtype: "success",
+									is_error: false,
+								},
+								stderr: "",
+								exitCode: 0,
+							}),
+						);
+					}),
+			);
+
+			const first = harness.agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "run something" }],
+			});
+			while (harness.legacyPromptCalls.length === 0) {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+
+			const releaseNext = async () => {
+				while (releases.length === 0) {
+					await new Promise((resolve) => setTimeout(resolve, 0));
+				}
+				releases.shift()?.();
+			};
+			return { ...harness, session, first, releaseNext };
 		}
 
-		await expect(
-			agent.prompt({
+		afterEach(() => {
+			delete process.env.CURSOR_ACP_STEERING;
+		});
+
+		it("rejects a second prompt when steering is disabled", async () => {
+			process.env.CURSOR_ACP_STEERING = "0";
+			const { agent, session, first, releaseNext } = await startBlockedTurn();
+
+			await expect(
+				agent.prompt({
+					sessionId: session.sessionId,
+					prompt: [{ type: "text", text: "second" }],
+				}),
+			).rejects.toThrow(/another prompt is in progress/);
+
+			await releaseNext();
+			await first;
+		});
+
+		it("steers the running turn when the runner accepts the text", async () => {
+			const steered: string[] = [];
+			const { agent, client, session, first, releaseNext, legacyPromptCalls } =
+				await startBlockedTurn({
+					clientCapabilities: { session: { notices: {} } },
+					steer: async (text) => {
+						steered.push(text);
+						return "complete_delivered";
+					},
+				});
+
+			const second = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "also do this" }],
+			});
+			while (steered.length === 0) {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			await releaseNext();
+
+			await expect(first).resolves.toMatchObject({ stopReason: "end_turn" });
+			await expect(second).resolves.toEqual({ stopReason: "end_turn" });
+			expect(steered).toEqual(["also do this"]);
+			expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["run something"]);
+			expect(
+				client.updates.some(
+					(u) =>
+						u.update.sessionUpdate === "notice" &&
+						u.update.title === "Message added to the running turn",
+				),
+			).toBe(true);
+		});
+
+		it("queues the prompt as a follow-up turn when steering is not possible", async () => {
+			const { agent, session, first, releaseNext, legacyPromptCalls } =
+				await startBlockedTurn();
+
+			const second = agent.prompt({
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "second" }],
-			}),
-		).rejects.toThrow(/another prompt is in progress/);
+			});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(legacyPromptCalls).toHaveLength(1);
 
-		resolvePrompt?.();
-		await first;
+			await releaseNext();
+			await first;
+			await releaseNext();
+
+			await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+			expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+				"run something",
+				"second",
+			]);
+		});
+
+		it("cancels queued follow-up prompts on session/cancel", async () => {
+			const { agent, session, first, releaseNext, legacyPromptCalls } =
+				await startBlockedTurn();
+
+			const second = agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "second" }],
+			});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			await agent.cancel({ sessionId: session.sessionId });
+			await releaseNext();
+
+			await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+			await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+			expect(legacyPromptCalls).toHaveLength(1);
+		});
 	});
 
 	it("rejects model changes while a prompt is active", async () => {
@@ -2600,7 +2707,7 @@ describe("CursorAcpAgent", () => {
 					clientCapabilities: {},
 				}),
 			);
-			await agent.unstable_resumeSession({
+			await agent.resumeSession({
 				sessionId: "session-1",
 				cwd: "/tmp/project",
 				mcpServers: [],
@@ -2617,6 +2724,88 @@ describe("CursorAcpAgent", () => {
 		} finally {
 			delete process.env.CURSOR_ACP_CONFIG_DIR;
 			await rm(tempRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("sends notices only to clients that advertise session notices", async () => {
+		for (const notices of [undefined, {}]) {
+			const { agent, client } = createAgentTestHarness();
+			await agent.initialize(
+				initRequest({
+					protocolVersion: 1,
+					clientCapabilities: notices ? { session: { notices } } : {},
+				}),
+			);
+			await agent.loadSession({ sessionId: "missing", cwd: "/tmp", mcpServers: [] });
+			await waitForScheduledUpdates();
+
+			const notice = client.updates.find((u) => u.update.sessionUpdate === "notice");
+			if (notices) {
+				expect(notice?.update).toMatchObject({
+					sessionUpdate: "notice",
+					severity: "warning",
+					title: "Saved session not found",
+				});
+			} else {
+				expect(notice).toBeUndefined();
+			}
+		}
+	});
+
+	it("reports Cursor task tool calls as subagents when the client supports them", async () => {
+		for (const subagents of [undefined, {}]) {
+			const { agent, client, setLegacyPromptHandler } = createAgentTestHarness();
+			await agent.initialize(
+				initRequest({
+					protocolVersion: 1,
+					clientCapabilities: subagents ? { subagents } : {},
+				}),
+			);
+			const session = await agent.newSession(newSessionRequest({ cwd: "/tmp" }));
+			setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				await onEvent?.({
+					type: "tool_call",
+					subtype: "started",
+					call_id: "task-1",
+					tool_call: {
+						taskToolCall: { args: { description: "Explore", prompt: "Look" } },
+					},
+				});
+				await onEvent?.({
+					type: "tool_call",
+					subtype: "completed",
+					call_id: "task-1",
+					tool_call: {
+						taskToolCall: { args: {}, result: { success: { text: "Found it" } } },
+					},
+				});
+				return {
+					events: [],
+					resultEvent: { type: "result", subtype: "success", is_error: false },
+					stderr: "",
+					exitCode: 0,
+				};
+			});
+
+			await agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "delegate" }],
+			});
+
+			const subagentUpdates = client.updates
+				.map((u) => u.update)
+				.filter((update) => update.sessionUpdate === "subagent_update");
+			if (subagents) {
+				expect(subagentUpdates.map((update) => update.state)).toEqual([
+					{ state: "running" },
+					{ state: "idle", stopReason: "end_turn" },
+				]);
+				expect(client.updates.some((u) => u.update.sessionUpdate === "tool_call")).toBe(
+					true,
+				);
+			} else {
+				expect(subagentUpdates).toEqual([]);
+			}
 		}
 	});
 });

@@ -55,7 +55,7 @@ import {
 	NativeSessionBackend,
 	NativeSessionCallbacks,
 } from "./cursor-native-acp-client.js";
-import type { CursorRunner, RunPromptOptions } from "./cursor-runner.js";
+import type { CursorPromptRun, CursorRunner, RunPromptOptions } from "./cursor-runner.js";
 import { CursorSdkRunner } from "./cursor-sdk-runner.js";
 import type {
 	ExtendedNewSessionResponse,
@@ -83,13 +83,16 @@ import {
 	isValidFastValue,
 	isValidThinkingLevel,
 	mergeModelCatalogs,
+	modelRequiresMaxMode,
 	normalizeModelId,
+	parameterValueRequiresMaxMode,
 	resolveDefaultContextValue,
 	resolveDefaultFastValue,
 	resolveDefaultThinkingLevel,
 	resolveModelId,
 	THINKING_PARAM_ID,
 	withCliModelParameters,
+	withMaxModeLabel,
 } from "./model-id.js";
 import {
 	parseLeadingSlashCommand,
@@ -107,6 +110,7 @@ import {
 	resolveSkillSlashCommandPrompt,
 } from "./slash-commands.js";
 import { CustomSkill, loadCustomSkills } from "./skills.js";
+import { SubagentTracker } from "./subagents.js";
 import {
 	AgentSessionModeId,
 	availableModes,
@@ -116,6 +120,7 @@ import {
 	getEnvDefaultModel,
 	getEnvDefaultThinking,
 	isAgentSessionMode,
+	isSteeringEnabled,
 	normalizeModeId,
 	SessionModeId,
 } from "./settings.js";
@@ -135,7 +140,7 @@ import {
 	recordTurnArtifactsFromNativeSessionUpdate,
 	type TurnArtifact,
 } from "./native-assistant-stream.js";
-import { isObject, Logger, unreachable } from "./utils.js";
+import { errorMessage, isObject, Logger, unreachable } from "./utils.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -504,6 +509,7 @@ interface ActivePromptState {
 
 interface ActiveRunState {
 	cancel: () => void;
+	steer?: CursorPromptRun["steer"];
 }
 
 interface PromptAttemptResult {
@@ -531,6 +537,12 @@ export interface SessionState {
 	cancelled: boolean;
 	activePrompt?: ActivePromptState;
 	activeRun?: ActiveRunState;
+	/** The current `session/prompt` turn, including its Auto-review retry. */
+	activeTurn?: Promise<PromptResponse>;
+	/** Incremented by `session/cancel`, so queued follow-up prompts know they were cancelled. */
+	cancelGeneration: number;
+	/** Present only when the client advertised `subagents`. */
+	subagents?: SubagentTracker;
 	backendSessionId?: string;
 	/** Populated from native `session/new` or `session/load` when available. */
 	nativeSessionModels?: LegacySessionModels;
@@ -674,7 +686,7 @@ export class CursorAcpAgent implements Agent {
 		});
 	}
 
-	async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
 		const filePath = await findSessionFile(params.sessionId, params.cwd);
 		const meta = filePath ? await readSessionMeta(filePath) : {};
 		const response = await this.createSession({
@@ -704,6 +716,11 @@ export class CursorAcpAgent implements Agent {
 
 			return this.buildResumeResponse(session, response);
 		});
+	}
+
+	/** Compatibility alias for callers that still use the pre-1.9 `unstable_` name. */
+	async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+		return await this.resumeSession(params);
 	}
 
 	async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -765,6 +782,12 @@ export class CursorAcpAgent implements Agent {
 				cwd: params.cwd,
 				mcpServers: params.mcpServers,
 			});
+			await this.emitNotice(
+				this.requireSession(params.sessionId),
+				"warning",
+				"Saved session not found",
+				"The adapter started a new, empty session with the same ID.",
+			);
 
 			return {
 				modes: response.modes,
@@ -888,13 +911,77 @@ export class CursorAcpAgent implements Agent {
 			throw RequestError.authRequired();
 		}
 
-		if (session.activePrompt || session.activeRun) {
-			throw RequestError.invalidParams(
-				undefined,
-				"Cannot send a prompt while another prompt is in progress",
+		if (session.activeTurn || session.activePrompt || session.activeRun) {
+			if (!isSteeringEnabled() || !session.activeTurn) {
+				throw RequestError.invalidParams(
+					undefined,
+					"Cannot send a prompt while another prompt is in progress",
+				);
+			}
+
+			const steered = await this.steerActiveTurn(session, promptText, promptImages);
+			if (steered) {
+				return steered;
+			}
+
+			const generation = session.cancelGeneration;
+			await this.emitNotice(
+				session,
+				"info",
+				"Message queued",
+				"The message runs after the current turn ends.",
 			);
+			while (session.activeTurn) {
+				await session.activeTurn.catch(() => undefined);
+			}
+			if (session.cancelGeneration !== generation) {
+				return { stopReason: "cancelled" };
+			}
 		}
 
+		const turn = this.runPromptTurn(session, promptText, promptImages);
+		session.activeTurn = turn;
+		try {
+			return await turn;
+		} finally {
+			if (session.activeTurn === turn) {
+				session.activeTurn = undefined;
+			}
+		}
+	}
+
+	/** Returns the turn result when the running turn accepted the text, else `undefined`. */
+	private async steerActiveTurn(
+		session: SessionState,
+		promptText: string,
+		promptImages: RunPromptOptions["images"],
+	): Promise<PromptResponse | undefined> {
+		const turn = session.activeTurn;
+		const steer = session.activeRun?.steer;
+		if (!turn || !steer || promptImages?.length) {
+			return undefined;
+		}
+
+		try {
+			if ((await steer(promptText)) !== "complete_delivered") {
+				return undefined;
+			}
+		} catch (error) {
+			this.logger.warn?.("[cursor-acp] Steering failed; queueing the prompt", error);
+			return undefined;
+		}
+
+		await recordUserMessage(session.cwd, session.sessionId, promptText);
+		await this.emitNotice(session, "info", "Message added to the running turn");
+		const result = await turn;
+		return { stopReason: result.stopReason };
+	}
+
+	private async runPromptTurn(
+		session: SessionState,
+		promptText: string,
+		promptImages: RunPromptOptions["images"],
+	): Promise<PromptResponse> {
 		session.cancelled = false;
 		await recordUserMessage(session.cwd, session.sessionId, promptText);
 		const firstAttempt = await this.runPromptAttempt(session, promptText, promptImages, false);
@@ -908,6 +995,12 @@ export class CursorAcpAgent implements Agent {
 			(session.modeId === "default" || session.modeId === "auto-review") &&
 			firstAttempt.rejectedToolCalls.length > 0
 		) {
+			await this.emitNotice(
+				session,
+				"warning",
+				"Auto-review stopped a tool call",
+				firstAttempt.rejectedToolCalls[0]!.title,
+			);
 			const approved = await this.requestPermissionToRetry(
 				session.sessionId,
 				firstAttempt.rejectedToolCalls[0]!,
@@ -944,6 +1037,7 @@ export class CursorAcpAgent implements Agent {
 	async cancel(params: CancelNotification): Promise<void> {
 		const session = this.requireSession(params.sessionId);
 		session.cancelled = true;
+		session.cancelGeneration += 1;
 		session.activeRun?.cancel();
 		await session.nativeClient?.cancel();
 	}
@@ -1242,6 +1336,7 @@ export class CursorAcpAgent implements Agent {
 			configuredContextValue,
 			lastAgentModeId: isAgentSessionMode(modeId) ? modeId : "auto-review",
 			cancelled: false,
+			cancelGeneration: 0,
 			nativeAvailableCommands: [],
 			customSlashCommands: [],
 			customSkills: [],
@@ -1294,12 +1389,24 @@ export class CursorAcpAgent implements Agent {
 				"[cursor-acp] Unable to load custom slash commands",
 				customSlashCommands.reason,
 			);
+			await this.emitNotice(
+				session,
+				"warning",
+				"Custom slash commands not loaded",
+				errorMessage(customSlashCommands.reason),
+			);
 		}
 
 		if (customSkills.status === "fulfilled") {
 			session.customSkills = customSkills.value;
 		} else {
 			this.logger.warn?.("[cursor-acp] Unable to load custom skills", customSkills.reason);
+			await this.emitNotice(
+				session,
+				"warning",
+				"Custom skills not loaded",
+				errorMessage(customSkills.reason),
+			);
 		}
 	}
 
@@ -1434,6 +1541,12 @@ export class CursorAcpAgent implements Agent {
 						session.nativeModelId = undefined;
 					}
 					this.logger.error("[cursor-acp] native ACP backend closed", error);
+					void this.emitNotice(
+						session,
+						"warning",
+						"Cursor backend stopped unexpectedly",
+						`${error.message}. The adapter starts a new backend on the next request.`,
+					);
 				},
 			},
 		);
@@ -1461,6 +1574,12 @@ export class CursorAcpAgent implements Agent {
 				this.logger.warn?.(
 					"[cursor-acp] Native session/load failed; starting a new native session",
 					error,
+				);
+				await this.emitNotice(
+					session,
+					"warning",
+					"Cursor session not restored",
+					`${errorMessage(error)}. The adapter started a new Cursor session, so earlier context can be missing.`,
 				);
 				session.nativeLoadSucceeded = false;
 				const response = await nativeClient.createSessionBackend();
@@ -1716,6 +1835,12 @@ export class CursorAcpAgent implements Agent {
 			listed = await this.runner.listModels();
 		} catch (error) {
 			this.logger.error("[cursor-acp] Unable to list models", error);
+			await this.emitNotice(
+				session,
+				"warning",
+				"Model list not refreshed",
+				errorMessage(error),
+			);
 		}
 
 		listed = withCliModelParameters(mergeModelCatalogs(listed, session.modelCatalog));
@@ -1782,10 +1907,20 @@ export class CursorAcpAgent implements Agent {
 				currentValue: session.modelId ?? models.currentModelId,
 				options: models.availableModels.map((model) => ({
 					value: model.modelId,
-					name: model.name,
+					name: withMaxModeLabel(
+						model.name,
+						modelRequiresMaxMode(session.modelCatalog, model.modelId),
+					),
 					description: model.description ?? undefined,
 				})),
 			});
+			const requiresMaxMode = (parameterId: string, value: string) =>
+				parameterValueRequiresMaxMode(
+					session.modelCatalog,
+					session.modelId,
+					parameterId,
+					value,
+				);
 
 			const fastParameter = getFastParameterForModel(session.modelCatalog, session.modelId);
 			if (fastParameter && session.fastValue) {
@@ -1815,7 +1950,10 @@ export class CursorAcpAgent implements Agent {
 						currentValue: session.fastValue,
 						options: fastParameter.values.map((value) => ({
 							value: value.value,
-							name: formatFastParameterOptionName(value.value, value.displayName),
+							name: withMaxModeLabel(
+								formatFastParameterOptionName(value.value, value.displayName),
+								requiresMaxMode(FAST_PARAM_ID, value.value),
+							),
 						})),
 					});
 				}
@@ -1852,7 +1990,10 @@ export class CursorAcpAgent implements Agent {
 						currentValue: session.thinkingLevel,
 						options: thinkingParameter.values.map((value) => ({
 							value: value.value,
-							name: value.displayName ?? value.value,
+							name: withMaxModeLabel(
+								value.displayName ?? value.value,
+								requiresMaxMode(thinkingParameter.id, value.value),
+							),
 						})),
 					});
 				}
@@ -1872,7 +2013,10 @@ export class CursorAcpAgent implements Agent {
 					currentValue: session.contextValue,
 					options: contextParameter.values.map((value) => ({
 						value: value.value,
-						name: value.displayName ?? value.value,
+						name: withMaxModeLabel(
+							value.displayName ?? value.value,
+							requiresMaxMode(CONTEXT_PARAM_ID, value.value),
+						),
 					})),
 				});
 			}
@@ -2141,6 +2285,13 @@ export class CursorAcpAgent implements Agent {
 					}
 					await this.client.sessionUpdate(notification);
 				}
+
+				if (this.clientCapabilities?.subagents != null) {
+					session.subagents ??= new SubagentTracker(session.sessionId);
+					for (const notification of session.subagents.handleEvent(event)) {
+						await this.client.sessionUpdate(notification);
+					}
+				}
 			},
 		});
 
@@ -2149,6 +2300,7 @@ export class CursorAcpAgent implements Agent {
 		try {
 			const completed = await run.completed;
 			session.activeRun = undefined;
+			await this.stopRunningSubagents(session);
 
 			if (session.cancelled) {
 				return {
@@ -2200,6 +2352,7 @@ export class CursorAcpAgent implements Agent {
 			throw RequestError.internalError(undefined, resultText || "Cursor failed");
 		} catch (error) {
 			session.activeRun = undefined;
+			await this.stopRunningSubagents(session);
 			if (session.cancelled) {
 				return {
 					stopReason: "cancelled",
@@ -2212,6 +2365,22 @@ export class CursorAcpAgent implements Agent {
 			}
 
 			throw RequestError.internalError(undefined, String(error));
+		}
+	}
+
+	private async stopRunningSubagents(session: SessionState): Promise<void> {
+		if (!session.subagents?.hasRunningChildren) {
+			return;
+		}
+		const notifications = session.subagents.stopAll(
+			session.cancelled ? { state: "idle", stopReason: "cancelled" } : { state: "unknown" },
+		);
+		for (const notification of notifications) {
+			try {
+				await this.client.sessionUpdate(notification);
+			} catch (error) {
+				this.logger.warn?.("[cursor-acp] Unable to report subagent state", error);
+			}
 		}
 	}
 
@@ -2317,6 +2486,31 @@ export class CursorAcpAgent implements Agent {
 		}
 
 		await this.client.sessionUpdate(notification);
+	}
+
+	private async emitNotice(
+		session: SessionState,
+		severity: Extract<SessionNotification["update"], { sessionUpdate: "notice" }>["severity"],
+		title: string,
+		description?: string,
+	): Promise<void> {
+		if (this.clientCapabilities?.session?.notices == null) {
+			return;
+		}
+
+		try {
+			await this.emitOrQueueNotification(session, {
+				sessionId: session.sessionId,
+				update: {
+					sessionUpdate: "notice",
+					severity,
+					title,
+					...(description ? { description } : {}),
+				},
+			});
+		} catch (error) {
+			this.logger.warn?.("[cursor-acp] Unable to send notice", title, error);
+		}
 	}
 
 	private async flushPendingNotifications(session: SessionState): Promise<void> {

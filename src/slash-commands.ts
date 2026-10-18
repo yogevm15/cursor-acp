@@ -27,6 +27,7 @@ export interface ModelVariantDescriptor {
 	modelId?: string;
 	params: Array<{ id: string; value: string }>;
 	isDefault?: boolean;
+	isMaxMode?: boolean;
 }
 
 export interface CursorModelDescriptor {

@@ -56,6 +56,12 @@ export function getEnvDefaultContext(): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/** A prompt sent during a running turn steers that turn unless `CURSOR_ACP_STEERING` is off. */
+export function isSteeringEnabled(): boolean {
+	const raw = process.env.CURSOR_ACP_STEERING?.trim().toLowerCase();
+	return raw !== "0" && raw !== "false" && raw !== "off";
+}
+
 export function normalizeModeId(value: string): SessionModeId | null {
 	if (ADVERTISED_MODE_IDS.includes(value as AdvertisedModeId)) {
 		return value as AdvertisedModeId;

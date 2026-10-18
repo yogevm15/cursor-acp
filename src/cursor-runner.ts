@@ -37,9 +37,14 @@ export interface RunPromptResult {
 	exitCode: number;
 }
 
+/** `revert_to_followup` means the running turn did not take the text; send it as a new turn. */
+export type SteerOutcome = "complete_delivered" | "revert_to_followup";
+
 export interface CursorPromptRun {
 	completed: Promise<RunPromptResult>;
 	cancel: () => void;
+	/** Adds text to the running turn. Runners without steering omit this. */
+	steer?: (text: string) => Promise<SteerOutcome>;
 }
 
 export interface CursorRunner {

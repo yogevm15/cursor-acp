@@ -4,6 +4,7 @@ import {
 	Cursor,
 	type AgentOptions,
 	type McpServerConfig,
+	type Run,
 	type SDKAgent,
 	type SDKMessage,
 } from "@cursor/sdk";
@@ -41,6 +42,7 @@ interface PromptHooks {
 	isCancelled: () => boolean;
 	waitUntilCancelled: () => Promise<void>;
 	setCancelRun: (cancel: () => Promise<void>) => void;
+	setSteerableRun: (run: Run | undefined) => void;
 }
 
 type OperationOutcome<T> =
@@ -118,6 +120,7 @@ export class CursorSdkRunner implements CursorRunner {
 							variants: model.variants.map((variant) => ({
 								params: variant.params,
 								isDefault: variant.isDefault,
+								...(variant.isMaxMode ? { isMaxMode: true } : {}),
 							})),
 						}
 					: {}),
@@ -132,6 +135,7 @@ export class CursorSdkRunner implements CursorRunner {
 	startPrompt(options: RunPromptOptions): CursorPromptRun {
 		let cancelled = false;
 		let cancelRun: (() => Promise<void>) | undefined;
+		let steerableRun: Run | undefined;
 		let resolveCancelled: (() => void) | undefined;
 		const cancelledPromise = new Promise<void>((resolve) => {
 			resolveCancelled = resolve;
@@ -154,13 +158,18 @@ export class CursorSdkRunner implements CursorRunner {
 					cancelActiveRun();
 				}
 			},
+			setSteerableRun: (run) => {
+				steerableRun = run;
+			},
 		});
 		void completed.then(
 			() => {
 				cancelRun = undefined;
+				steerableRun = undefined;
 			},
 			() => {
 				cancelRun = undefined;
+				steerableRun = undefined;
 			},
 		);
 
@@ -173,6 +182,13 @@ export class CursorSdkRunner implements CursorRunner {
 				cancelled = true;
 				resolveCancelled?.();
 				cancelActiveRun();
+			},
+			steer: async (text) => {
+				const run = steerableRun;
+				if (cancelled || !run?.steer) {
+					return "revert_to_followup";
+				}
+				return await run.steer(text);
 			},
 		};
 	}
@@ -263,6 +279,7 @@ export class CursorSdkRunner implements CursorRunner {
 			}
 			const run = sendOutcome.value;
 			hooks.setCancelRun(() => run.cancel());
+			hooks.setSteerableRun(run);
 			const streamCompleted = (async () => {
 				for await (const message of run.stream()) {
 					let duplicateRunningToolCall = false;
@@ -302,6 +319,7 @@ export class CursorSdkRunner implements CursorRunner {
 			})();
 
 			const streamOutcome = await this.completeOperation(streamCompleted, hooks, agent);
+			hooks.setSteerableRun(undefined);
 			if (streamOutcome.cancelled) {
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
 				await emit(resultEvent);

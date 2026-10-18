@@ -955,6 +955,32 @@ export function applyContextValue(
 	return parameterModel?.modelId;
 }
 
+/** True when the catalog lists variants for the model and every one of them needs Max Mode. */
+export function modelRequiresMaxMode(
+	modelCatalog: CursorModelDescriptor[] | undefined,
+	modelId: string | undefined,
+): boolean {
+	const variants = findModelInCatalog(modelCatalog, modelId)?.variants ?? [];
+	return variants.length > 0 && variants.every((variant) => variant.isMaxMode === true);
+}
+
+/** True when every catalog variant with this parameter value needs Max Mode. */
+export function parameterValueRequiresMaxMode(
+	modelCatalog: CursorModelDescriptor[] | undefined,
+	modelId: string | undefined,
+	parameterId: string,
+	value: string,
+): boolean {
+	const variants = (findParameterModelInCatalog(modelCatalog, modelId)?.variants ?? []).filter(
+		(variant) => variantParamValue(variant, parameterId) === value,
+	);
+	return variants.length > 0 && variants.every((variant) => variant.isMaxMode === true);
+}
+
+export function withMaxModeLabel(name: string, requiresMaxMode: boolean): string {
+	return requiresMaxMode ? `${name} (Max Mode)` : name;
+}
+
 /** Token count for SDK context values such as `272k` or `1m`. */
 export function contextWindowTokens(contextValue: string | undefined): number | undefined {
 	const match = contextValue?.trim().match(/^(\d+(?:\.\d+)?)\s*([km])?$/i);
