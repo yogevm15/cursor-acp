@@ -59,8 +59,8 @@
     "node": ">=22.13"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.4.0",
-    "@cursor/sdk": "1.0.28",
+    "@agentclientprotocol/sdk": "1.9.0",
+    "@cursor/sdk": "1.0.38",
     "@typescript/native-preview": "^7.0.0-dev.20260430.1",
     "oxfmt": "^0.47.0",
     "oxlint": "^1.62.0"

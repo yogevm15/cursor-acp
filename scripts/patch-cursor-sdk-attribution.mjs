@@ -5,60 +5,93 @@ import { fileURLToPath } from "node:url";
 const sdkEntry = fileURLToPath(import.meta.resolve("@cursor/sdk"));
 const distDirectory = resolve(dirname(sdkEntry), "..");
 
+const ORIGINAL_DEFAULT = "!0";
+const COMMITS_DEFAULT = '"false"!==process.env.CURSOR_ACP_ATTRIBUTE_COMMITS_TO_AGENT';
+const PRS_DEFAULT = '"false"!==process.env.CURSOR_ACP_ATTRIBUTE_PRS_TO_AGENT';
+
+// Minified identifiers change between SDK releases; the surrounding logic must not.
+const id = "[\\w$]+";
+
+function escapeRegExp(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitPattern(commitsDefault, prsDefault) {
+	const commits = escapeRegExp(commitsDefault);
+	const prs = escapeRegExp(prsDefault);
+	return new RegExp(
+		`(${id})=this\\.attributionConfigProvider\\?\\.get\\(\\),(${id})=!(${id})&&\\(\\1\\?\\.attribution\\?\\.attributeCommitsToAgent\\?\\?${commits}\\),(${id})=!\\3&&\\(\\1\\?\\.attribution\\?\\.attributePRsToAgent\\?\\?${prs}\\)`,
+		"g",
+	);
+}
+
+function bundledPattern(commitsDefault, prsDefault) {
+	const commits = escapeRegExp(commitsDefault);
+	const prs = escapeRegExp(prsDefault);
+	return new RegExp(
+		`let (${id})=this\\.attributionConfigProvider\\?\\.get\\(\\);let (${id})=(${id})\\?!1:\\1\\?\\.attribution\\?\\.attributeCommitsToAgent\\?\\?${commits};let (${id})=\\3\\?!1:\\1\\?\\.attribution\\?\\.attributePRsToAgent\\?\\?${prs}`,
+		"g",
+	);
+}
+
+function jsFiles(directory) {
+	return readdirSync(join(distDirectory, directory))
+		.filter((name) => name.endsWith(".js"))
+		.map((name) => join(distDirectory, directory, name));
+}
+
 const variants = [
-	{
-		name: "ESM",
-		paths: readdirSync(join(distDirectory, "esm"))
-			.filter((name) => name.endsWith(".js"))
-			.map((name) => join(distDirectory, "esm", name)),
-		original:
-			"E=this.attributionConfigProvider?.get(),x=!y&&(E?.attribution?.attributeCommitsToAgent??!0),C=!y&&(E?.attribution?.attributePRsToAgent??!0)",
-		patched:
-			'E=this.attributionConfigProvider?.get(),x=!y&&(E?.attribution?.attributeCommitsToAgent??"false"!==process.env.CURSOR_ACP_ATTRIBUTE_COMMITS_TO_AGENT),C=!y&&(E?.attribution?.attributePRsToAgent??"false"!==process.env.CURSOR_ACP_ATTRIBUTE_PRS_TO_AGENT)',
-	},
-	{
-		name: "CommonJS",
-		paths: readdirSync(join(distDirectory, "cjs"))
-			.filter((name) => name.endsWith(".js"))
-			.map((name) => join(distDirectory, "cjs", name)),
-		original:
-			"E=this.attributionConfigProvider?.get(),x=!y&&(E?.attribution?.attributeCommitsToAgent??!0),C=!y&&(E?.attribution?.attributePRsToAgent??!0)",
-		patched:
-			'E=this.attributionConfigProvider?.get(),x=!y&&(E?.attribution?.attributeCommitsToAgent??"false"!==process.env.CURSOR_ACP_ATTRIBUTE_COMMITS_TO_AGENT),C=!y&&(E?.attribution?.attributePRsToAgent??"false"!==process.env.CURSOR_ACP_ATTRIBUTE_PRS_TO_AGENT)',
-	},
+	{ name: "ESM", paths: jsFiles("esm"), pattern: splitPattern },
+	{ name: "CommonJS", paths: jsFiles("cjs"), pattern: splitPattern },
 	{
 		name: "bundled",
 		paths: [join(distDirectory, "bundled", "index.js")],
-		original:
-			"let P=this.attributionConfigProvider?.get();let k=U?!1:P?.attribution?.attributeCommitsToAgent??!0;let j=U?!1:P?.attribution?.attributePRsToAgent??!0",
-		patched:
-			'let P=this.attributionConfigProvider?.get();let k=U?!1:P?.attribution?.attributeCommitsToAgent??"false"!==process.env.CURSOR_ACP_ATTRIBUTE_COMMITS_TO_AGENT;let j=U?!1:P?.attribution?.attributePRsToAgent??"false"!==process.env.CURSOR_ACP_ATTRIBUTE_PRS_TO_AGENT',
+		pattern: bundledPattern,
 	},
 ];
 
+function countMatches(source, pattern) {
+	return source.match(pattern)?.length ?? 0;
+}
+
 for (const variant of variants) {
+	const original = variant.pattern(ORIGINAL_DEFAULT, ORIGINAL_DEFAULT);
+	const patched = variant.pattern(COMMITS_DEFAULT, PRS_DEFAULT);
 	const originalMatches = [];
-	const patchedMatches = [];
+	let patchedCount = 0;
 
 	for (const path of variant.paths) {
 		const source = readFileSync(path, "utf8");
-		if (source.includes(variant.original)) {
-			originalMatches.push({ path, source });
+		const originalCount = countMatches(source, original);
+		if (originalCount > 0) {
+			originalMatches.push({ path, source, count: originalCount });
 		}
-		if (source.includes(variant.patched)) {
-			patchedMatches.push(path);
-		}
+		patchedCount += countMatches(source, patched);
 	}
 
-	if (patchedMatches.length === 1 && originalMatches.length === 0) {
+	const originalCount = originalMatches.reduce((sum, match) => sum + match.count, 0);
+	if (patchedCount === 1 && originalCount === 0) {
 		continue;
 	}
-	if (originalMatches.length !== 1 || patchedMatches.length !== 0) {
+	if (originalCount !== 1 || patchedCount !== 0) {
 		throw new Error(
 			`Cannot safely patch @cursor/sdk ${variant.name} attribution logic: expected one original or patched match`,
 		);
 	}
 
 	const [{ path, source }] = originalMatches;
-	writeFileSync(path, source.replace(variant.original, variant.patched));
+	writeFileSync(
+		path,
+		source.replace(original, (match) =>
+			match
+				.replace(
+					`attributeCommitsToAgent??${ORIGINAL_DEFAULT}`,
+					`attributeCommitsToAgent??${COMMITS_DEFAULT}`,
+				)
+				.replace(
+					`attributePRsToAgent??${ORIGINAL_DEFAULT}`,
+					`attributePRsToAgent??${PRS_DEFAULT}`,
+				),
+		),
+	);
 }
