@@ -141,8 +141,19 @@ import {
 	type TurnArtifact,
 } from "./native-assistant-stream.js";
 import { errorMessage, isObject, Logger, unreachable } from "./utils.js";
+import {
+	continuationPrompt,
+	CursorRunError,
+	describeCursorFailure,
+	failureFromResultEvent,
+	failureFromThrown,
+} from "./cursor-run-failure.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+
+/** Delay before each automatic retry of a rate-limited or interrupted Cursor run. */
+const DEFAULT_PROMPT_RETRY_DELAYS_MS = Array.from({ length: 30 }, () => 1_000);
 
 function markdownEscape(text: string): string {
 	let fence = "```";
@@ -541,6 +552,8 @@ export interface SessionState {
 	activeTurn?: Promise<PromptResponse>;
 	/** Incremented by `session/cancel`, so queued follow-up prompts know they were cancelled. */
 	cancelGeneration: number;
+	/** Aborted by `session/cancel` to stop waiting before an automatic retry. */
+	retryWait?: AbortController;
 	/** Present only when the client advertised `subagents`. */
 	subagents?: SubagentTracker;
 	backendSessionId?: string;
@@ -573,6 +586,8 @@ export interface CursorAcpAgentOptions {
 		callbacks: NativeSessionCallbacks,
 	) => NativeSessionBackend;
 	nativeCommand?: string;
+	/** Backoff before each automatic retry of a failed Cursor run; its length caps the retries. */
+	promptRetryDelaysMs?: readonly number[];
 }
 
 export class CursorAcpAgent implements Agent {
@@ -592,6 +607,7 @@ export class CursorAcpAgent implements Agent {
 		callbacks: NativeSessionCallbacks,
 	) => NativeSessionBackend;
 	private readonly nativeCommand?: string;
+	private readonly promptRetryDelaysMs: readonly number[];
 
 	constructor(
 		private readonly client: CursorAcpClient,
@@ -601,6 +617,7 @@ export class CursorAcpAgent implements Agent {
 		this.runner = options.runner ?? new CursorSdkRunner(undefined, this.logger);
 		this.auth = options.auth ?? new CursorAuth();
 		this.nativeCommand = options.nativeCommand;
+		this.promptRetryDelaysMs = options.promptRetryDelaysMs ?? DEFAULT_PROMPT_RETRY_DELAYS_MS;
 		this.createNativeClient =
 			options.createNativeClient ??
 			((nativeOptions, callbacks) => new CursorNativeAcpClient(nativeOptions, callbacks));
@@ -984,7 +1001,12 @@ export class CursorAcpAgent implements Agent {
 	): Promise<PromptResponse> {
 		session.cancelled = false;
 		await recordUserMessage(session.cwd, session.sessionId, promptText);
-		const firstAttempt = await this.runPromptAttempt(session, promptText, promptImages, false);
+		const firstAttempt = await this.runPromptAttemptWithRetries(
+			session,
+			promptText,
+			promptImages,
+			false,
+		);
 
 		if (firstAttempt.stopReason === "cancelled" || session.cancelled) {
 			return { stopReason: "cancelled" };
@@ -1023,7 +1045,12 @@ export class CursorAcpAgent implements Agent {
 			}
 
 			if (approved === "allow_once" || approved === "allow_always") {
-				const retry = await this.runPromptAttempt(session, promptText, promptImages, true);
+				const retry = await this.runPromptAttemptWithRetries(
+					session,
+					promptText,
+					promptImages,
+					true,
+				);
 				return promptResponse(
 					retry.stopReason,
 					addAcpUsage(firstAttempt.usage, retry.usage),
@@ -1038,6 +1065,7 @@ export class CursorAcpAgent implements Agent {
 		const session = this.requireSession(params.sessionId);
 		session.cancelled = true;
 		session.cancelGeneration += 1;
+		session.retryWait?.abort();
 		session.activeRun?.cancel();
 		await session.nativeClient?.cancel();
 	}
@@ -2225,6 +2253,7 @@ export class CursorAcpAgent implements Agent {
 		const modeSettings = this.modeToRunnerOptions(session, forceRetry);
 		const assistantTextChunks: string[] = [];
 		let usage: Usage | undefined;
+		let toolsRan = false;
 
 		await this.ensureLegacyBackendSessionId(session);
 
@@ -2242,6 +2271,9 @@ export class CursorAcpAgent implements Agent {
 			contextValue: session.contextValue,
 			mcpServers: session.mcpServers,
 			onEvent: async (event) => {
+				if (event.type === "tool_call") {
+					toolsRan = true;
+				}
 				const turnUsage = turnUsageFromEvent(event);
 				if (turnUsage) {
 					usage = addAcpUsage(usage, toAcpUsage(turnUsage.usage));
@@ -2347,9 +2379,7 @@ export class CursorAcpAgent implements Agent {
 				};
 			}
 
-			const resultText =
-				typeof resultEvent.result === "string" ? resultEvent.result : subtype;
-			throw RequestError.internalError(undefined, resultText || "Cursor failed");
+			throw new CursorRunError(failureFromResultEvent(resultEvent), toolsRan);
 		} catch (error) {
 			session.activeRun = undefined;
 			await this.stopRunningSubagents(session);
@@ -2360,12 +2390,121 @@ export class CursorAcpAgent implements Agent {
 				};
 			}
 
-			if (error instanceof RequestError) {
+			if (error instanceof RequestError || error instanceof CursorRunError) {
 				throw error;
 			}
 
-			throw RequestError.internalError(undefined, String(error));
+			throw new CursorRunError(failureFromThrown(error), toolsRan);
 		}
+	}
+
+	/**
+	 * Retries a rate-limited or interrupted run with backoff. Once a failed attempt has run
+	 * tools, later attempts ask the model to continue instead of resending the prompt.
+	 */
+	private async runPromptAttemptWithRetries(
+		session: SessionState,
+		promptText: string,
+		images: RunPromptOptions["images"],
+		forceRetry: boolean,
+	): Promise<PromptAttemptResult> {
+		let toolsRan = false;
+		for (let retries = 0; ; retries++) {
+			const attemptPrompt = toolsRan ? continuationPrompt(promptText) : promptText;
+			try {
+				return await this.runPromptAttempt(session, attemptPrompt, images, forceRetry);
+			} catch (error) {
+				if (!(error instanceof CursorRunError)) {
+					throw error;
+				}
+				toolsRan ||= error.toolsRan;
+				const delayMs = this.promptRetryDelaysMs[retries];
+				if (!error.failure.retryable || delayMs === undefined) {
+					throw await this.reportRunFailure(session, error, toolsRan, retries);
+				}
+				if (!(await this.waitBeforeRetry(session, error, delayMs, retries))) {
+					return { stopReason: "cancelled", rejectedToolCalls: [] };
+				}
+			}
+		}
+	}
+
+	/** Resolves `false` when `session/cancel` interrupts the wait. */
+	private async waitBeforeRetry(
+		session: SessionState,
+		error: CursorRunError,
+		delayMs: number,
+		retries: number,
+	): Promise<boolean> {
+		if (session.cancelled) {
+			return false;
+		}
+		const title =
+			error.failure.kind === "rate_limit"
+				? "Cursor rate limit hit"
+				: "Cursor connection interrupted";
+		const seconds = Math.round(delayMs / 1000);
+		const maxRetries = this.promptRetryDelaysMs.length;
+		// One notice per turn; a notice for every quick retry would flood the client.
+		if (retries === 0) {
+			await this.emitNotice(
+				session,
+				"warning",
+				title,
+				`Retrying in ${seconds} s, up to ${maxRetries} ${maxRetries === 1 ? "time" : "times"}. Cancel to stop.`,
+			);
+		}
+		this.logger.warn?.(
+			`[cursor-acp] ${title}; retry ${retries + 1}/${maxRetries} in ${seconds}s`,
+			error.failure.code ?? error.failure.message,
+		);
+
+		const wait = new AbortController();
+		session.retryWait = wait;
+		try {
+			await sleep(delayMs, undefined, { signal: wait.signal });
+		} catch {
+			// Aborted by session/cancel.
+		} finally {
+			if (session.retryWait === wait) {
+				session.retryWait = undefined;
+			}
+		}
+		return !session.cancelled;
+	}
+
+	private async reportRunFailure(
+		session: SessionState,
+		error: CursorRunError,
+		toolsRan: boolean,
+		retries: number,
+	): Promise<RequestError> {
+		const { failure } = error;
+		const modelName =
+			findParameterModelInCatalog(session.modelCatalog, session.modelId)?.name ??
+			session.modelId ??
+			"auto";
+		const { title, description } = describeCursorFailure(failure, {
+			modelName,
+			toolsRan,
+			retries,
+		});
+		await this.emitNotice(session, "error", title, description);
+
+		const message =
+			failure.kind === "unknown"
+				? `${title}. ${description}`
+				: `${title}. ${description} (Cursor: ${failure.message})`;
+		const data = {
+			kind: failure.kind,
+			...(failure.code ? { code: failure.code } : {}),
+			...(failure.requestId ? { requestId: failure.requestId } : {}),
+			retries,
+			cursorMessage: failure.message,
+		};
+		return failure.kind === "auth"
+			? RequestError.authRequired(data, message)
+			: RequestError.internalError(data, message);
 	}
 
 	private async stopRunningSubagents(session: SessionState): Promise<void> {

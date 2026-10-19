@@ -247,6 +247,7 @@ function createAgentTestHarness(
 		createSessionBlocker?: Promise<void>;
 		createSessionBlockers?: Array<Promise<void> | undefined>;
 		models?: CursorModelDescriptor[];
+		promptRetryDelaysMs?: number[];
 	} = {},
 ) {
 	const backends: FakeNativeBackend[] = [];
@@ -325,6 +326,7 @@ function createAgentTestHarness(
 			},
 		},
 		runner,
+		promptRetryDelaysMs: backendOptions.promptRetryDelaysMs ?? [],
 		createNativeClient(options, callbacks) {
 			const backend = new FakeNativeBackend(
 				options,
@@ -2807,5 +2809,154 @@ describe("CursorAcpAgent", () => {
 				expect(subagentUpdates).toEqual([]);
 			}
 		}
+	});
+
+	describe("Cursor run failures", () => {
+		const rateLimited = {
+			events: [],
+			resultEvent: {
+				type: "result",
+				subtype: "error",
+				is_error: true,
+				result: "[resource_exhausted] Error",
+				error_code: "resource_exhausted",
+			},
+			stderr: "[resource_exhausted] Error",
+			exitCode: 1,
+		};
+		const succeeded = {
+			events: [],
+			resultEvent: { type: "result", subtype: "success", is_error: false },
+			stderr: "",
+			exitCode: 0,
+		};
+		const toolCall = {
+			type: "tool_call",
+			subtype: "completed",
+			call_id: "t1",
+			tool_call: {
+				editToolCall: { args: { path: "/tmp/a.ts" }, result: { success: {} } },
+			},
+		};
+
+		async function startSession(promptRetryDelaysMs: number[]) {
+			const harness = createAgentTestHarness({ promptRetryDelaysMs });
+			await harness.agent.initialize(
+				initRequest({
+					protocolVersion: 1,
+					clientCapabilities: { session: { notices: {} } },
+				}),
+			);
+			const session = await harness.agent.newSession(newSessionRequest({ cwd: "/tmp" }));
+			return { ...harness, sessionId: session.sessionId };
+		}
+
+		function notices(client: FakeClient) {
+			return client.updates
+				.map((u) => u.update)
+				.filter((update) => update.sessionUpdate === "notice");
+		}
+
+		it("retries a rate-limited run and resends the prompt when no tool ran", async () => {
+			const { agent, client, legacyPromptCalls, setLegacyPromptHandler, sessionId } =
+				await startSession([0, 0, 0]);
+			let attempts = 0;
+			setLegacyPromptHandler(async () => (++attempts <= 2 ? rateLimited : succeeded));
+
+			const response = await agent.prompt({
+				sessionId,
+				prompt: [{ type: "text", text: "fix the bug" }],
+			});
+
+			expect(response.stopReason).toBe("end_turn");
+			expect(legacyPromptCalls.map((call) => call.promptText)).toEqual([
+				"fix the bug",
+				"fix the bug",
+				"fix the bug",
+			]);
+			expect(notices(client)).toEqual([
+				expect.objectContaining({
+					severity: "warning",
+					title: "Cursor rate limit hit",
+					description: expect.stringContaining("up to 3 times"),
+				}),
+			]);
+		});
+
+		it("asks the model to continue once a failed attempt has run tools", async () => {
+			const { agent, legacyPromptCalls, setLegacyPromptHandler, sessionId } =
+				await startSession([0]);
+			let attempts = 0;
+			setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				if (++attempts > 1) return succeeded;
+				await onEvent?.(toolCall);
+				return rateLimited;
+			});
+
+			await agent.prompt({ sessionId, prompt: [{ type: "text", text: "fix the bug" }] });
+
+			expect(legacyPromptCalls).toHaveLength(2);
+			expect(legacyPromptCalls[1]!.promptText).toContain("check the current state");
+			expect(legacyPromptCalls[1]!.promptText).toMatch(/fix the bug$/);
+		});
+
+		it("explains the failure once retries run out", async () => {
+			const { agent, client, legacyPromptCalls, setLegacyPromptHandler, sessionId } =
+				await startSession([0]);
+			setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				await onEvent?.(toolCall);
+				return rateLimited;
+			});
+
+			const failure = agent.prompt({
+				sessionId,
+				prompt: [{ type: "text", text: "fix the bug" }],
+			});
+
+			await expect(failure).rejects.toMatchObject({
+				message: expect.stringContaining("Cursor rate limit reached"),
+				data: { kind: "rate_limit", code: "resource_exhausted", retries: 1 },
+			});
+			expect(legacyPromptCalls).toHaveLength(2);
+			expect(notices(client).slice(-1)[0]).toMatchObject({
+				severity: "error",
+				title: "Cursor rate limit reached",
+				description: expect.stringContaining("Send “continue”"),
+			});
+		});
+
+		it("does not retry a plan usage limit", async () => {
+			const { agent, legacyPromptCalls, setLegacyPromptHandler, sessionId } =
+				await startSession([0, 0]);
+			setLegacyPromptHandler(async () => ({
+				...rateLimited,
+				resultEvent: {
+					...rateLimited.resultEvent,
+					result: "You've hit your usage limit",
+					error_code: "PRO_USER_USAGE_LIMIT",
+				},
+			}));
+
+			await expect(
+				agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] }),
+			).rejects.toMatchObject({
+				message: expect.stringContaining("Cursor usage limit reached"),
+				data: { kind: "usage_limit", retries: 0 },
+			});
+			expect(legacyPromptCalls).toHaveLength(1);
+		});
+
+		it("stops waiting to retry when the prompt is cancelled", async () => {
+			const { agent, client, legacyPromptCalls, setLegacyPromptHandler, sessionId } =
+				await startSession([60_000]);
+			setLegacyPromptHandler(async () => rateLimited);
+
+			const turn = agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+			await vi.waitFor(() => expect(notices(client)).toHaveLength(1));
+			await agent.cancel({ sessionId });
+
+			await expect(turn).resolves.toMatchObject({ stopReason: "cancelled" });
+			expect(legacyPromptCalls).toHaveLength(1);
+		});
 	});
 });

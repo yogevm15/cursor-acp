@@ -20,6 +20,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - **ACP permission fallback**: A call stopped by Auto Review is surfaced to the client. “Allow once” retries that turn with Auto Review disabled; “Always allow” switches the session to Yolo.
 - **Correct SDK mode lifecycle**: Auto Review is an agent-level SDK option. Switching review policy closes and resumes the same SDK agent with the new policy; the SDK's unrelated crash-recovery `force` flag is never used as an approval bypass.
 - **Stable prompt lifecycle**: Standalone Cursor transport diagnostics fail the ACP turn instead of being treated as successful replies. Cancellation drains final SDK events and retires an unresponsive agent after a bounded wait.
+- **Automatic retry for temporary failures**: When Cursor rate-limits a run or the connection drops, the adapter retries once a second, up to 30 times, and sends a notice when it starts retrying. Cancel stops the wait. If tools already ran, the retry asks the model to check the current state and continue instead of resending the prompt. Usage-limit, sign-in, and conversation-length errors are not retried. Each of these errors says what happened and whether earlier edits were kept, and the raw SDK error (code, request id, model) is logged to stderr.
 - **Model parameters**: Canonical SDK model IDs, thinking/reasoning/effort levels, fast values, context window sizes, and variants flow into SDK model selections. The adapter keeps the catalog's original parameter ids.
 - **Context window and token usage**: Models with an SDK `context` parameter (for example `272k` / `1m`) get a **Context** selector. After each turn, the adapter returns the turn's token counts in the ACP prompt response (`usage`) and sends a `usage_update` with the tokens in context and the window size.
 - **MCP and images**: ACP-provided stdio/HTTP/SSE MCP servers and image chunks are forwarded to the SDK.
@@ -219,7 +220,7 @@ When you send a prompt while a turn is running, the adapter adds the text to the
 
 ### Client capabilities
 
-- **Notices** — clients that advertise `clientCapabilities.session.notices` receive `notice` updates for warnings such as a missing saved session, an Auto-review stop, or a backend restart.
+- **Notices** — clients that advertise `clientCapabilities.session.notices` receive `notice` updates for warnings such as a missing saved session, an Auto-review stop, a backend restart, or a Cursor rate-limit retry.
 - **Subagents** — clients that advertise `clientCapabilities.subagents` receive `subagent_update` and `session_message` updates for Cursor `task` tool calls. The tool call itself still appears in the parent session.
 
 The adapter accepts a `session/new` or `session/load` request without `mcpServers`, and it ignores malformed `mcpServers` entries. The maximum size of one incoming ACP message is 256 MiB. Set `CURSOR_ACP_MAX_MESSAGE_BYTES` to change it.

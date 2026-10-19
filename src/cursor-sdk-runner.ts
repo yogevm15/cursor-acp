@@ -59,6 +59,23 @@ function isResumableAgentId(agentId: string | undefined): agentId is string {
 	return typeof agentId === "string" && agentId.length > 0 && !isPendingAgentId(agentId);
 }
 
+/** Reads the structured fields a thrown `CursorSdkError` carries. */
+function sdkErrorDetails(error: unknown): {
+	errorCode?: string;
+	requestId?: string;
+	retryable?: boolean;
+} {
+	if (typeof error !== "object" || error === null) {
+		return {};
+	}
+	const { code, requestId, isRetryable } = error as Record<string, unknown>;
+	return {
+		...(typeof code === "string" ? { errorCode: code } : {}),
+		...(typeof requestId === "string" ? { requestId } : {}),
+		...(typeof isRetryable === "boolean" ? { retryable: isRetryable } : {}),
+	};
+}
+
 function sdkMcpServers(
 	servers: McpServer[] | undefined,
 ): Record<string, McpServerConfig> | undefined {
@@ -360,6 +377,7 @@ export class CursorSdkRunner implements CursorRunner {
 						...sdkRunResultToCursorResultEvent({
 							status: "error",
 							errorText: transportFailure,
+							requestId: finished.requestId ?? run.requestId,
 						}),
 						subtype: "transport_error",
 					};
@@ -368,12 +386,17 @@ export class CursorSdkRunner implements CursorRunner {
 						status: finished.status,
 						resultText: finished.result,
 						errorText: finished.error?.message ?? finished.result,
+						errorCode: finished.error?.code,
+						requestId: finished.requestId ?? run.requestId,
 					});
 					stderr =
 						finished.status === "error"
 							? (finished.error?.message ?? finished.result ?? "")
 							: "";
 				}
+			}
+			if (resultEvent.is_error === true) {
+				this.logRunFailure(options, agent.agentId, run.id, resultEvent);
 			}
 			await emit(resultEvent);
 			return {
@@ -390,8 +413,11 @@ export class CursorSdkRunner implements CursorRunner {
 			resultEvent = sdkRunResultToCursorResultEvent(
 				hooks.isCancelled()
 					? { status: "cancelled" }
-					: { status: "error", errorText: stderr },
+					: { status: "error", errorText: stderr, ...sdkErrorDetails(error) },
 			);
+			if (resultEvent.is_error === true) {
+				this.logRunFailure(options, agent?.agentId, undefined, resultEvent, error);
+			}
 			await emit(resultEvent);
 			return { events, resultEvent, stderr, exitCode: hooks.isCancelled() ? 0 : 1 };
 		}
@@ -431,6 +457,30 @@ export class CursorSdkRunner implements CursorRunner {
 			void operation.catch(() => undefined);
 		}
 		return { cancelled: true, ...settled };
+	}
+
+	/** Leaves the raw failure on stderr; the ACP client usually shows only a summary. */
+	private logRunFailure(
+		options: RunPromptOptions,
+		agentId: string | undefined,
+		runId: string | undefined,
+		resultEvent: CursorStreamEvent,
+		cause?: unknown,
+	): void {
+		this.logger.error(
+			"[cursor-acp] SDK run failed:",
+			JSON.stringify({
+				agentId,
+				runId,
+				requestId: resultEvent.request_id,
+				model: options.modelId ?? "auto",
+				subtype: resultEvent.subtype,
+				code: resultEvent.error_code,
+				retryable: resultEvent.retryable,
+				message: resultEvent.result,
+			}),
+			...(cause === undefined ? [] : [cause]),
+		);
 	}
 
 	private retireAgent(agent: SDKAgent): void {

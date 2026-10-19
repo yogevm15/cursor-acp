@@ -109,6 +109,9 @@ export function sdkRunResultToCursorResultEvent(args: {
 	status: "finished" | "error" | "cancelled";
 	resultText?: string;
 	errorText?: string;
+	errorCode?: string;
+	requestId?: string;
+	retryable?: boolean;
 }): CursorStreamEvent {
 	if (args.status === "finished") {
 		return {
@@ -126,5 +129,8 @@ export function sdkRunResultToCursorResultEvent(args: {
 		subtype: "error",
 		is_error: true,
 		result: args.errorText ?? "Cursor SDK run failed",
+		...(args.errorCode ? { error_code: args.errorCode } : {}),
+		...(args.requestId ? { request_id: args.requestId } : {}),
+		...(args.retryable !== undefined ? { retryable: args.retryable } : {}),
 	};
 }

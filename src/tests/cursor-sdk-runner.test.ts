@@ -277,6 +277,65 @@ describe("CursorSdkRunner", () => {
 		expect(agent.close).toHaveBeenCalledOnce();
 	});
 
+	it("carries the SDK error code and request id, and logs the failure", async () => {
+		const agent = sdkAgent("agent-real");
+		const failedRun = Object.assign(sdkRun(), {
+			id: "run-1",
+			wait: vi.fn(async () => ({
+				id: "run-1",
+				requestId: "req-1",
+				status: "error",
+				error: { message: "[resource_exhausted] Error", code: "resource_exhausted" },
+			})),
+		});
+		agent.send.mockResolvedValue(failedRun as unknown as ReturnType<typeof sdkRun>);
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const errorLog = vi.fn();
+		const runner = new CursorSdkRunner("test-key", { log() {}, error: errorLog });
+
+		const result = await runner.startPrompt({
+			workspace: "/tmp/project",
+			prompt: "hello",
+			modelId: "claude-opus-5-5",
+		}).completed;
+
+		expect(result.resultEvent).toMatchObject({
+			subtype: "error",
+			is_error: true,
+			result: "[resource_exhausted] Error",
+			error_code: "resource_exhausted",
+			request_id: "req-1",
+		});
+		expect(errorLog).toHaveBeenCalledWith(
+			"[cursor-acp] SDK run failed:",
+			expect.stringContaining('"code":"resource_exhausted"'),
+		);
+		expect(errorLog.mock.calls[0]![1]).toContain('"model":"claude-opus-5-5"');
+	});
+
+	it("carries structured fields from a thrown SDK error", async () => {
+		const agent = sdkAgent("agent-real");
+		agent.send.mockRejectedValue(
+			Object.assign(new Error("Slow down"), {
+				code: "resource_exhausted",
+				isRetryable: true,
+				requestId: "req-2",
+			}),
+		);
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const result = await runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" })
+			.completed;
+
+		expect(result.resultEvent).toMatchObject({
+			is_error: true,
+			error_code: "resource_exhausted",
+			request_id: "req-2",
+			retryable: true,
+		});
+	});
+
 	it("does not mistake an explanation containing a transport diagnostic for failure", async () => {
 		const agent = sdkAgent("agent-real", [
 			{
