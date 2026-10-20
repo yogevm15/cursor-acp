@@ -21,9 +21,11 @@ import type {
 	CursorPromptRun,
 	CursorRunner,
 	CursorStreamEvent,
+	ForkChatOptions,
 	RunPromptOptions,
 	RunPromptResult,
 } from "./cursor-runner.js";
+import { forkLocalAgent, type OpenLocalAgentStore } from "./cursor-sdk-fork.js";
 import { CursorTransportFailure } from "./cursor-transport-failure.js";
 import { buildSdkModelSelection, ensureAutoModel } from "./model-id.js";
 import type { CursorModelDescriptor } from "./slash-commands.js";
@@ -112,6 +114,7 @@ export class CursorSdkRunner implements CursorRunner {
 	constructor(
 		private readonly apiKey: string | undefined = getCursorApiKey(),
 		private readonly logger: Logger = console,
+		private readonly openStore?: OpenLocalAgentStore,
 	) {}
 
 	async listModels(): Promise<CursorModelDescriptor[]> {
@@ -147,6 +150,18 @@ export class CursorSdkRunner implements CursorRunner {
 
 	async createChat(): Promise<string> {
 		return `${PENDING_AGENT_PREFIX}${randomUUID()}`;
+	}
+
+	async forkChat(options: ForkChatOptions): Promise<string | undefined> {
+		if (!isResumableAgentId(options.backendSessionId)) {
+			return undefined;
+		}
+		return await forkLocalAgent({
+			agentId: options.backendSessionId,
+			sourceWorkspace: options.sourceWorkspace,
+			workspace: options.workspace,
+			...(this.openStore ? { openStore: this.openStore } : {}),
+		});
 	}
 
 	startPrompt(options: RunPromptOptions): CursorPromptRun {
@@ -237,14 +252,20 @@ export class CursorSdkRunner implements CursorRunner {
 			]);
 			if (agentOutcome.cancelled) {
 				void agentCompleted
-					.then((lateAgent) => this.retireAgent(lateAgent))
+					.then((late) => this.retireAgent(late.agent))
 					.catch(() => undefined);
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
 				await emit(resultEvent);
 				return { events, resultEvent, stderr, exitCode: 0 };
 			}
-			agent = agentOutcome.value;
-			await emit({ type: "system", subtype: "init", session_id: agent.agentId });
+			agent = agentOutcome.value.agent;
+			const { missingAgentId } = agentOutcome.value;
+			await emit({
+				type: "system",
+				subtype: "init",
+				session_id: agent.agentId,
+				...(missingAgentId ? { missing_session_id: missingAgentId } : {}),
+			});
 			if (hooks.isCancelled()) {
 				resultEvent = sdkRunResultToCursorResultEvent({ status: "cancelled" });
 				await emit(resultEvent);
@@ -530,13 +551,17 @@ export class CursorSdkRunner implements CursorRunner {
 		};
 	}
 
-	private async resolveAgent(options: RunPromptOptions): Promise<SDKAgent> {
+	/** `missingAgentId` is set when the requested agent was not found and a new one was made. */
+	private async resolveAgent(
+		options: RunPromptOptions,
+	): Promise<{ agent: SDKAgent; missingAgentId?: string }> {
 		const backendSessionId = options.backendSessionId;
 		const configKey = this.agentConfig(options).key;
+		let missingAgentId: string | undefined;
 		if (backendSessionId) {
 			const cached = this.agents.get(backendSessionId);
 			if (cached && cached.cwd === options.workspace && cached.configKey === configKey) {
-				return cached.agent;
+				return { agent: cached.agent };
 			}
 			if (cached) {
 				cached.agent.close();
@@ -544,13 +569,24 @@ export class CursorSdkRunner implements CursorRunner {
 			}
 
 			if (isResumableAgentId(backendSessionId)) {
-				const agent = await Agent.resume(backendSessionId, this.agentOptions(options));
-				this.agents.set(backendSessionId, {
-					agent,
-					cwd: options.workspace,
-					configKey,
-				});
-				return agent;
+				try {
+					const agent = await Agent.resume(backendSessionId, this.agentOptions(options));
+					this.agents.set(backendSessionId, {
+						agent,
+						cwd: options.workspace,
+						configKey,
+					});
+					return { agent };
+				} catch (error) {
+					if (sdkErrorDetails(error).errorCode !== "agent_not_found") {
+						throw error;
+					}
+					this.logger.warn?.(
+						"[cursor-acp] Saved SDK agent not found; creating a new agent",
+						backendSessionId,
+					);
+					missingAgentId = backendSessionId;
+				}
 			}
 		}
 
@@ -559,6 +595,6 @@ export class CursorSdkRunner implements CursorRunner {
 			this.agents.delete(backendSessionId);
 		}
 		this.agents.set(agent.agentId, { agent, cwd: options.workspace, configKey });
-		return agent;
+		return { agent, ...(missingAgentId ? { missingAgentId } : {}) };
 	}
 }

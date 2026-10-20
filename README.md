@@ -28,8 +28,9 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 
 ### Wrapper compatibility
 
-- **ACP session lifecycle**: Supports `new`, `resume`, and `fork` (best-effort) session operations
-- **Session persistence & history replay**: Stores visible history locally and replays it on resume/load
+- **ACP session lifecycle**: Supports `new`, `resume`, and `fork` session operations
+- **Session persistence & history replay**: Stores visible history locally and replays it on resume, load, and fork. Resume and load continue the saved local SDK agent, so the model keeps the full earlier context. If that agent is not in the SDK store, the adapter starts a new agent and sends a notice.
+- **Session fork**: `session/fork` copies the source session's local SDK agent (its conversation checkpoint and record) to a new agent, and copies the visible history and the mode, model, and parameter settings. If the source is in a turn, the fork starts from the last finished turn. If the agent cannot be copied, the first prompt of the fork carries the visible history (the newest 100,000 characters) and the adapter sends a notice. The SDK has no fork API, so the copy uses the SDK's public `LocalAgentStore` interface.
 - **Session listing**: Lists past local sessions with optional cwd filtering and pagination
 - **Model listing and selection**: `/model` and ACP config options use the SDK catalog.
 - **ACP 1.4 controls**: Clients that advertise boolean config support receive Fast and on/off Thinking parameters as native toggles; older clients receive a select fallback. Multi-level thinking/reasoning/effort parameters remain selectors. After `session/set_config_option`, the adapter sends `config_option_update` so dependent Fast and Thinking controls appear immediately.

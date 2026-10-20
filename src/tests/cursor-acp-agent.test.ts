@@ -23,7 +23,13 @@ import { CursorAcpAgent } from "../cursor-acp-agent.js";
 import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { RunPromptOptions } from "../cursor-cli-runner.js";
 import type { SteerOutcome } from "../cursor-runner.js";
-import { recordAssistantMessage, recordUserMessage } from "../session-storage.js";
+import {
+	readSessionMeta,
+	recordAssistantMessage,
+	recordSessionMeta,
+	recordUserMessage,
+	sessionFilePath,
+} from "../session-storage.js";
 import type { CursorModelDescriptor } from "../slash-commands.js";
 import {
 	agentTestAccess,
@@ -248,6 +254,7 @@ function createAgentTestHarness(
 		createSessionBlockers?: Array<Promise<void> | undefined>;
 		models?: CursorModelDescriptor[];
 		promptRetryDelaysMs?: number[];
+		forkChat?: TestCliRunner["forkChat"];
 	} = {},
 ) {
 	const backends: FakeNativeBackend[] = [];
@@ -267,6 +274,7 @@ function createAgentTestHarness(
 		async createChat() {
 			return "legacy-chat-1";
 		},
+		...(backendOptions.forkChat ? { forkChat: backendOptions.forkChat } : {}),
 		async listModels() {
 			return (
 				backendOptions.models ?? [
@@ -2727,6 +2735,217 @@ describe("CursorAcpAgent", () => {
 			delete process.env.CURSOR_ACP_CONFIG_DIR;
 			await rm(tempRoot, { recursive: true, force: true });
 		}
+	});
+
+	describe("saved Cursor agents", () => {
+		let tempRoot: string;
+		const noticeCapabilities = { session: { notices: {} } } as ClientCapabilities;
+
+		beforeEach(async () => {
+			tempRoot = await mkdtemp(path.join(os.tmpdir(), "cursor-acp-agent-fork-"));
+			process.env.CURSOR_ACP_CONFIG_DIR = tempRoot;
+		});
+
+		afterEach(async () => {
+			delete process.env.CURSOR_ACP_CONFIG_DIR;
+			await rm(tempRoot, { recursive: true, force: true });
+		});
+
+		async function seedSourceSession() {
+			await recordSessionMeta("/tmp/source", "source", {
+				backendSessionId: "agent-source",
+				modeId: "yolo",
+				modelId: "gpt-5.2",
+			});
+			await recordUserMessage("/tmp/source", "source", "What is 2+2?");
+			await recordAssistantMessage("/tmp/source", "source", "4");
+		}
+
+		function noticeTitles(updates: SessionNotification[], sessionId: string): string[] {
+			return updates
+				.filter((u) => u.sessionId === sessionId && u.update.sessionUpdate === "notice")
+				.map((u) => (u.update as { title: string }).title);
+		}
+
+		it("resumes the saved Cursor agent of a stored session", async () => {
+			await seedSourceSession();
+			const { agent, legacyPromptCalls } = createAgentTestHarness();
+			await agent.initialize(initRequest());
+
+			await agent.resumeSession({ sessionId: "source", cwd: "/tmp/source", mcpServers: [] });
+			await agent.prompt({ sessionId: "source", prompt: [{ type: "text", text: "next" }] });
+
+			expect(legacyPromptCalls[0]).toMatchObject({
+				promptText: "next",
+				backendSessionId: "agent-source",
+			});
+		});
+
+		it("continues the same Cursor agent after an adapter restart", async () => {
+			const first = createAgentTestHarness();
+			await first.agent.initialize(initRequest());
+			const created = await first.agent.newSession(newSessionRequest({ cwd: "/tmp/project" }));
+			first.setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				await onEvent?.({ type: "system", subtype: "init", session_id: "agent-original" });
+				return {
+					events: [],
+					resultEvent: { type: "result", subtype: "success", is_error: false },
+					stderr: "",
+					exitCode: 0,
+				};
+			});
+			await first.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "make a plan" }],
+			});
+
+			for (const method of ["resumeSession", "loadSession"] as const) {
+				const restarted = createAgentTestHarness();
+				await restarted.agent.initialize(initRequest());
+				await restarted.agent[method]({
+					sessionId: created.sessionId,
+					cwd: "/tmp/project",
+					mcpServers: [],
+				});
+				await restarted.agent.prompt({
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "implement it" }],
+				});
+
+				expect(restarted.legacyPromptCalls[0], method).toMatchObject({
+					promptText: "implement it",
+					backendSessionId: "agent-original",
+				});
+			}
+		});
+
+		it("forks the Cursor agent, history, and settings into a new session", async () => {
+			await seedSourceSession();
+			const forkChat = vi.fn(async () => "agent-fork");
+			const { agent, client, legacyPromptCalls } = createAgentTestHarness({ forkChat });
+			await agent.initialize(initRequest({ clientCapabilities: noticeCapabilities }));
+
+			const forked = await agent.unstable_forkSession({
+				sessionId: "source",
+				cwd: "/tmp/fork",
+				mcpServers: [],
+			});
+			await waitForScheduledUpdates();
+
+			expect(forked.sessionId).not.toBe("source");
+			expect(forkChat).toHaveBeenCalledWith({
+				backendSessionId: "agent-source",
+				sourceWorkspace: "/tmp/source",
+				workspace: "/tmp/fork",
+			});
+			expect(forked.modes?.currentModeId).toBe("yolo");
+			expect(forked.configOptions?.find((option) => option.id === "model")).toMatchObject({
+				currentValue: "gpt-5.2",
+			});
+			const replayed = client.updates.filter((u) => u.sessionId === forked.sessionId);
+			expect(replayed.map((u) => u.update.sessionUpdate)).toEqual(
+				expect.arrayContaining(["user_message_chunk", "agent_message_chunk"]),
+			);
+			expect(noticeTitles(client.updates, forked.sessionId)).toEqual([]);
+			expect(
+				await readSessionMeta(sessionFilePath("/tmp/fork", forked.sessionId)),
+			).toMatchObject({ backendSessionId: "agent-fork", modeId: "yolo" });
+
+			await agent.prompt({
+				sessionId: forked.sessionId,
+				prompt: [{ type: "text", text: "and 3+3?" }],
+			});
+			expect(legacyPromptCalls[0]).toMatchObject({
+				promptText: "and 3+3?",
+				backendSessionId: "agent-fork",
+			});
+		});
+
+		it("sends the visible history once when the Cursor agent cannot be copied", async () => {
+			await seedSourceSession();
+			const forkChat = vi.fn(async () => {
+				throw new Error("store locked");
+			});
+			const { agent, client, legacyPromptCalls, setLegacyPromptHandler } =
+				createAgentTestHarness({ forkChat });
+			await agent.initialize(initRequest({ clientCapabilities: noticeCapabilities }));
+
+			const forked = await agent.unstable_forkSession({
+				sessionId: "source",
+				cwd: "/tmp/source",
+			});
+			await waitForScheduledUpdates();
+			expect(noticeTitles(client.updates, forked.sessionId)).toEqual([
+				"Cursor context not copied",
+			]);
+
+			setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				await onEvent?.({ type: "system", subtype: "init", session_id: "agent-new" });
+				await onEvent?.({
+					type: "assistant",
+					message: { content: [{ type: "text", text: "6" }] },
+				});
+				return {
+					events: [],
+					resultEvent: { type: "result", subtype: "success", is_error: false },
+					stderr: "",
+					exitCode: 0,
+				};
+			});
+			await agent.prompt({
+				sessionId: forked.sessionId,
+				prompt: [{ type: "text", text: "and 3+3?" }],
+			});
+			await agent.prompt({
+				sessionId: forked.sessionId,
+				prompt: [{ type: "text", text: "and 4+4?" }],
+			});
+
+			expect(legacyPromptCalls[0]!.backendSessionId).toBe("legacy-chat-1");
+			expect(legacyPromptCalls[0]!.promptText).toContain(
+				"<earlier_conversation>\nUser:\nWhat is 2+2?\n\nAssistant:\n4\n",
+			);
+			expect(legacyPromptCalls[0]!.promptText.endsWith("New message:\nand 3+3?")).toBe(true);
+			expect(legacyPromptCalls[1]!.promptText).toBe("and 4+4?");
+		});
+
+		it("rejects a fork of an unknown session", async () => {
+			const { agent } = createAgentTestHarness({ forkChat: vi.fn() });
+			await agent.initialize(initRequest());
+
+			await expect(
+				agent.unstable_forkSession({ sessionId: "missing", cwd: "/tmp" }),
+			).rejects.toThrow("Invalid params");
+		});
+
+		it("tells the client when the saved Cursor agent was not found", async () => {
+			const { agent, client, setLegacyPromptHandler } = createAgentTestHarness();
+			await agent.initialize(initRequest({ clientCapabilities: noticeCapabilities }));
+			const session = await agent.newSession(newSessionRequest());
+			setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				await onEvent?.({
+					type: "system",
+					subtype: "init",
+					session_id: "agent-new",
+					missing_session_id: "agent-gone",
+				});
+				return {
+					events: [],
+					resultEvent: { type: "result", subtype: "success", is_error: false },
+					stderr: "",
+					exitCode: 0,
+				};
+			});
+
+			await agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "hello" }],
+			});
+
+			expect(noticeTitles(client.updates, session.sessionId)).toContain(
+				"Cursor session not restored",
+			);
+		});
 	});
 
 	it("sends notices only to clients that advertise session notices", async () => {

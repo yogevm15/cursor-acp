@@ -122,6 +122,7 @@ export async function recordSessionMeta(
  * Read session metadata from the session file, returning the latest stored values.
  */
 export async function readSessionMeta(filePath: string): Promise<{
+	cwd?: string;
 	backendSessionId?: string;
 	modeId?: SessionModeId;
 	modelId?: string;
@@ -132,6 +133,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 	try {
 		const content = await fs.promises.readFile(filePath, "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
+		let lastCwd: string | undefined;
 		let lastBackend: string | undefined;
 		let lastModeId: SessionModeId | undefined;
 		let lastModelId: string | undefined;
@@ -142,6 +144,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			try {
 				const entry = JSON.parse(line) as {
 					type?: string;
+					cwd?: string;
 					backendSessionId?: string;
 					modeId?: string;
 					modelId?: string;
@@ -151,6 +154,9 @@ export async function readSessionMeta(filePath: string): Promise<{
 				};
 				if (entry.type !== "session_meta") {
 					continue;
+				}
+				if (typeof entry.cwd === "string" && entry.cwd) {
+					lastCwd = entry.cwd;
 				}
 				if (entry.backendSessionId) {
 					lastBackend = entry.backendSessionId;
@@ -178,6 +184,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 			}
 		}
 		return {
+			cwd: lastCwd,
 			backendSessionId: lastBackend,
 			modeId: lastModeId,
 			modelId: lastModelId,
@@ -452,6 +459,87 @@ export interface ReplayOptions {
 	sendNotification: (notification: SessionNotification) => Promise<void>;
 }
 
+interface StoredHistoryMessage {
+	entry: SessionHistoryEntry;
+	role: "user" | "assistant";
+	text: string;
+}
+
+/** Parses one JSONL line; returns `undefined` for metadata, other sessions, and bad lines. */
+function parseHistoryMessage(line: string, sessionId: string): StoredHistoryMessage | undefined {
+	const trimmed = line.trim();
+	if (!trimmed) {
+		return undefined;
+	}
+
+	let entry: SessionHistoryEntry;
+	try {
+		entry = JSON.parse(trimmed) as SessionHistoryEntry;
+	} catch {
+		return undefined;
+	}
+
+	if (entry.type !== "user" && entry.type !== "assistant") {
+		return undefined;
+	}
+
+	if (entry.sessionId && entry.sessionId !== sessionId) {
+		return undefined;
+	}
+
+	const message = entry.message;
+	if (!message) {
+		return undefined;
+	}
+
+	const role = message.role;
+	if (role !== "user" && role !== "assistant") {
+		return undefined;
+	}
+
+	const content = message.content;
+	if (typeof content !== "string" && !Array.isArray(content)) {
+		return undefined;
+	}
+
+	const text =
+		typeof content === "string"
+			? content
+			: content
+					.map((item) => {
+						if (typeof item === "string") {
+							return item;
+						}
+						if (
+							typeof item === "object" &&
+							item !== null &&
+							"text" in item &&
+							typeof (item as { text: unknown }).text === "string"
+						) {
+							return (item as { text: string }).text;
+						}
+						return "";
+					})
+					.join("");
+
+	return { entry, role, text };
+}
+
+async function readHistoryMessages(
+	filePath: string,
+	sessionId: string,
+): Promise<StoredHistoryMessage[]> {
+	const content = await fs.promises.readFile(filePath, "utf-8");
+	const messages: StoredHistoryMessage[] = [];
+	for (const line of content.split("\n")) {
+		const message = parseHistoryMessage(line, sessionId);
+		if (message) {
+			messages.push(message);
+		}
+	}
+	return messages;
+}
+
 /**
  * Replay session history by reading the JSONL file and emitting ACP notifications.
  */
@@ -466,86 +554,88 @@ export async function replaySessionHistory(options: ReplayOptions): Promise<void
 
 	try {
 		for await (const line of reader) {
-			const trimmed = line.trim();
-			if (!trimmed) {
-				continue;
-			}
-
-			let entry: SessionHistoryEntry;
-			try {
-				entry = JSON.parse(trimmed) as SessionHistoryEntry;
-			} catch {
-				continue;
-			}
-
-			if (entry.type !== "user" && entry.type !== "assistant") {
-				continue;
-			}
-
-			if (entry.sessionId && entry.sessionId !== sessionId) {
-				continue;
-			}
-
-			const message = entry.message;
+			const message = parseHistoryMessage(line, sessionId);
 			if (!message) {
 				continue;
 			}
 
-			const role = message.role;
-			if (role !== "user" && role !== "assistant") {
-				continue;
-			}
-
-			const content = message.content;
-			if (typeof content !== "string" && !Array.isArray(content)) {
-				continue;
-			}
-
-			const textContent =
-				typeof content === "string"
-					? content
-					: content
-							.map((item) => {
-								if (typeof item === "string") {
-									return item;
-								}
-								if (
-									typeof item === "object" &&
-									item !== null &&
-									"text" in item &&
-									typeof (item as { text: unknown }).text === "string"
-								) {
-									return (item as { text: string }).text;
-								}
-								return "";
-							})
-							.join("");
-
-			if (role === "user") {
-				await sendNotification({
-					sessionId,
-					update: {
-						sessionUpdate: "user_message_chunk",
-						content: {
-							type: "text",
-							text: textContent,
-						},
+			await sendNotification({
+				sessionId,
+				update: {
+					sessionUpdate:
+						message.role === "user" ? "user_message_chunk" : "agent_message_chunk",
+					content: {
+						type: "text",
+						text: message.text,
 					},
-				});
-			} else {
-				await sendNotification({
-					sessionId,
-					update: {
-						sessionUpdate: "agent_message_chunk",
-						content: {
-							type: "text",
-							text: textContent,
-						},
-					},
-				});
-			}
+				},
+			});
 		}
 	} finally {
 		reader.close();
 	}
+}
+
+/**
+ * Copies the visible history of one session into a new session file. Session metadata is
+ * not copied; the caller records it for the new session.
+ */
+export async function copySessionHistory(options: {
+	sourceFilePath: string;
+	sourceSessionId: string;
+	cwd: string;
+	sessionId: string;
+}): Promise<void> {
+	const messages = await readHistoryMessages(options.sourceFilePath, options.sourceSessionId);
+	await ensureSessionDir(options.cwd);
+	const lines = messages.map(
+		({ entry }) =>
+			JSON.stringify({ ...entry, sessionId: options.sessionId, cwd: options.cwd }) + "\n",
+	);
+	await fs.promises.writeFile(sessionFilePath(options.cwd, options.sessionId), lines.join(""), {
+		encoding: "utf-8",
+		flag: "wx",
+	});
+}
+
+/** Keeps the text prompt that carries earlier history within a usable size. */
+const HISTORY_PROMPT_MAX_CHARS = 100_000;
+
+/**
+ * Builds a prompt prefix that gives a new Cursor agent the visible history of a session.
+ * The oldest messages are dropped first when the history is too long.
+ * Returns `undefined` when the session has no stored messages.
+ */
+export async function buildHistoryPromptPrefix(
+	filePath: string,
+	sessionId: string,
+): Promise<string | undefined> {
+	const messages = await readHistoryMessages(filePath, sessionId);
+	const blocks: string[] = [];
+	let length = 0;
+	let omitted = false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index]!;
+		const block = `${message.role === "user" ? "User" : "Assistant"}:\n${message.text}`;
+		if (length + block.length > HISTORY_PROMPT_MAX_CHARS) {
+			omitted = true;
+			break;
+		}
+		blocks.unshift(block);
+		length += block.length;
+	}
+	if (blocks.length === 0) {
+		return undefined;
+	}
+
+	return [
+		"This conversation continues an earlier conversation. Use the earlier messages below as context.",
+		...(omitted ? ["Older messages are not included because the history is long."] : []),
+		"<earlier_conversation>",
+		blocks.join("\n\n"),
+		"</earlier_conversation>",
+		"",
+		"New message:",
+		"",
+	].join("\n");
 }

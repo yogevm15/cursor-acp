@@ -47,8 +47,21 @@ export interface CursorPromptRun {
 	steer?: (text: string) => Promise<SteerOutcome>;
 }
 
+export interface ForkChatOptions {
+	backendSessionId: string;
+	/** Workspace of the source session. */
+	sourceWorkspace: string;
+	/** Workspace of the new session. */
+	workspace: string;
+}
+
 export interface CursorRunner {
 	listModels(): Promise<CursorModelDescriptor[]>;
 	createChat(): Promise<string>;
 	startPrompt(options: RunPromptOptions): CursorPromptRun;
+	/**
+	 * Copies a backend chat and returns the ID of the copy. Returns `undefined` when the
+	 * source has no backend chat to copy. Runners that cannot copy chats omit this.
+	 */
+	forkChat?(options: ForkChatOptions): Promise<string | undefined>;
 }

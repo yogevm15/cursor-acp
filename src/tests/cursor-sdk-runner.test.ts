@@ -7,6 +7,7 @@ import {
 	CURSOR_ACP_ATTRIBUTE_PRS_ENV,
 } from "../cursor-cli-config.js";
 import type { CursorStreamEvent } from "../cursor-runner.js";
+import type { ForkableLocalAgentStore } from "../cursor-sdk-fork.js";
 import { CursorSdkRunner } from "../cursor-sdk-runner.js";
 
 const sdkMocks = vi.hoisted(() => ({
@@ -133,6 +134,74 @@ describe("CursorSdkRunner", () => {
 			"retry",
 			expect.not.objectContaining({ local: expect.anything() }),
 		);
+	});
+
+	it("creates a new agent and reports the missing one when a saved agent is gone", async () => {
+		sdkMocks.agentResume.mockRejectedValue(
+			Object.assign(new Error("Agent agent-gone not found"), { code: "agent_not_found" }),
+		);
+		const created = sdkAgent("agent-new");
+		sdkMocks.agentCreate.mockResolvedValue(created);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const result = await runner.startPrompt({
+			workspace: "/tmp/project",
+			backendSessionId: "agent-gone",
+			prompt: "hello",
+		}).completed;
+
+		expect(created.send).toHaveBeenCalledOnce();
+		expect(result.events[0]).toEqual({
+			type: "system",
+			subtype: "init",
+			session_id: "agent-new",
+			missing_session_id: "agent-gone",
+		});
+		expect(result.exitCode).toBe(0);
+	});
+
+	it("fails the run when resuming a saved agent fails for another reason", async () => {
+		sdkMocks.agentResume.mockRejectedValue(
+			Object.assign(new Error("database locked"), { code: "storage_error" }),
+		);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		const result = await runner.startPrompt({
+			workspace: "/tmp/project",
+			backendSessionId: "agent-existing",
+			prompt: "hello",
+		}).completed;
+
+		expect(sdkMocks.agentCreate).not.toHaveBeenCalled();
+		expect(result.exitCode).toBe(1);
+	});
+
+	it("forks only real agents, in the store of each workspace", async () => {
+		const opened: string[] = [];
+		const runner = new CursorSdkRunner("test-key", logger, async (workspace) => {
+			opened.push(workspace);
+			return {
+				agents: { get: async () => null },
+			} as unknown as ForkableLocalAgentStore;
+		});
+
+		await expect(
+			runner.forkChat({
+				backendSessionId: await runner.createChat(),
+				sourceWorkspace: "/tmp/a",
+				workspace: "/tmp/a",
+			}),
+		).resolves.toBeUndefined();
+		expect(opened).toEqual([]);
+
+		await expect(
+			runner.forkChat({
+				backendSessionId: "agent-missing",
+				sourceWorkspace: "/tmp/a",
+				workspace: "/tmp/b",
+			}),
+		).resolves.toBeUndefined();
+		expect(opened).toEqual(["/tmp/a", "/tmp/b"]);
 	});
 
 	it("forwards ACP MCP servers and image chunks to the SDK", async () => {

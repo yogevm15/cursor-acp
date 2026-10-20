@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import {
+	buildHistoryPromptPrefix,
+	copySessionHistory,
 	encodeProjectPath,
 	sessionFilePath,
 	ensureSessionDir,
@@ -168,10 +170,73 @@ describe("session-storage", () => {
 
 			const meta = await readSessionMeta(sessionFilePath(cwd, sessionId));
 			expect(meta).toEqual({
+				cwd,
 				backendSessionId: "backend-2",
 				modeId: "yolo",
 				modelId: "gpt-5.2",
 			});
+		});
+	});
+
+	describe("copySessionHistory", () => {
+		it("copies only the visible messages and rewrites the session id and cwd", async () => {
+			const sourceCwd = "/Users/test/source";
+			const cwd = "/Users/test/fork";
+			await recordSessionMeta(sourceCwd, "source", { backendSessionId: "agent-1" });
+			await recordUserMessage(sourceCwd, "source", "Hello");
+			await recordAssistantMessage(sourceCwd, "source", [{ type: "text", text: "Hi" }]);
+
+			await copySessionHistory({
+				sourceFilePath: sessionFilePath(sourceCwd, "source"),
+				sourceSessionId: "source",
+				cwd,
+				sessionId: "fork",
+			});
+
+			const entries = fs
+				.readFileSync(sessionFilePath(cwd, "fork"), "utf-8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			expect(entries).toMatchObject([
+				{ type: "user", sessionId: "fork", cwd, message: { content: "Hello" } },
+				{ type: "assistant", sessionId: "fork", cwd },
+			]);
+			expect(await readSessionMeta(sessionFilePath(cwd, "fork"))).toEqual({});
+		});
+	});
+
+	describe("buildHistoryPromptPrefix", () => {
+		it("wraps the visible messages before the new message", async () => {
+			const cwd = "/Users/test/project";
+			await recordUserMessage(cwd, "s", "What is 2+2?");
+			await recordAssistantMessage(cwd, "s", "4");
+
+			const prefix = await buildHistoryPromptPrefix(sessionFilePath(cwd, "s"), "s");
+
+			expect(prefix).toContain(
+				"<earlier_conversation>\nUser:\nWhat is 2+2?\n\nAssistant:\n4\n",
+			);
+			expect(prefix?.endsWith("</earlier_conversation>\n\nNew message:\n")).toBe(true);
+		});
+
+		it("drops the oldest messages when the history is too long", async () => {
+			const cwd = "/Users/test/project";
+			await recordUserMessage(cwd, "s", "old ".repeat(30_000));
+			await recordUserMessage(cwd, "s", "recent");
+
+			const prefix = await buildHistoryPromptPrefix(sessionFilePath(cwd, "s"), "s");
+
+			expect(prefix).toContain("Older messages are not included");
+			expect(prefix).toContain("recent");
+			expect(prefix).not.toContain("old old");
+		});
+
+		it("returns undefined when there are no messages", async () => {
+			const cwd = "/Users/test/project";
+			await recordSessionMeta(cwd, "s", { modeId: "yolo" });
+
+			expect(await buildHistoryPromptPrefix(sessionFilePath(cwd, "s"), "s")).toBeUndefined();
 		});
 	});
 

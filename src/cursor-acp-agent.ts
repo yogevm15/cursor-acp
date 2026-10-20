@@ -125,6 +125,8 @@ import {
 	SessionModeId,
 } from "./settings.js";
 import {
+	buildHistoryPromptPrefix,
+	copySessionHistory,
 	findSessionFile,
 	getCursorAcpConfigDir,
 	listSessions,
@@ -133,6 +135,7 @@ import {
 	recordSessionMeta,
 	recordUserMessage,
 	replaySessionHistory,
+	sessionFilePath,
 } from "./session-storage.js";
 import {
 	appendAssistantTextFromNativeChunk,
@@ -557,6 +560,8 @@ export interface SessionState {
 	/** Present only when the client advertised `subagents`. */
 	subagents?: SubagentTracker;
 	backendSessionId?: string;
+	/** Earlier visible history for a forked session whose Cursor agent was not copied. */
+	historyPromptPrefix?: string;
 	/** Populated from native `session/new` or `session/load` when available. */
 	nativeSessionModels?: LegacySessionModels;
 	/** Populated from the active runner's model catalog. */
@@ -695,12 +700,102 @@ export class CursorAcpAgent implements Agent {
 		});
 	}
 
+	/**
+	 * Copies the source session's Cursor agent and visible history to a new session. When the
+	 * agent cannot be copied, the next prompt carries the visible history instead.
+	 */
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+		const source = this.sessions[params.sessionId];
+		const sourceFilePath = await findSessionFile(params.sessionId, source?.cwd ?? params.cwd);
+		if (!source && !sourceFilePath) {
+			throw RequestError.invalidParams(undefined, `Session not found: ${params.sessionId}`);
+		}
+		const meta = sourceFilePath ? await readSessionMeta(sourceFilePath) : {};
+		const sourceCwd = source?.cwd ?? meta.cwd ?? params.cwd;
+		const sourceBackendSessionId = source ? source.backendSessionId : meta.backendSessionId;
+
 		const sessionId = randomUUID();
-		return await this.createSession({
-			sessionId,
+		const backendSessionId = await this.forkBackendSession({
+			sourceSessionId: params.sessionId,
+			sourceCwd,
+			sourceBackendSessionId,
 			cwd: params.cwd,
 		});
+		let filePath: string | undefined;
+		if (sourceFilePath) {
+			await copySessionHistory({
+				sourceFilePath,
+				sourceSessionId: params.sessionId,
+				cwd: params.cwd,
+				sessionId,
+			});
+			filePath = sessionFilePath(params.cwd, sessionId);
+		}
+		const historyPromptPrefix =
+			!backendSessionId && filePath
+				? await buildHistoryPromptPrefix(filePath, sessionId)
+				: undefined;
+
+		const response = await this.createSession({
+			sessionId,
+			cwd: params.cwd,
+			mcpServers: params.mcpServers ?? source?.mcpServers,
+			preferredModeId: source?.modeId ?? meta.modeId,
+			preferredModelId: source ? (source.configuredModelId ?? source.modelId) : meta.modelId,
+			preferredThinkingLevel: source
+				? (source.configuredThinkingLevel ?? source.thinkingLevel)
+				: meta.thinkingLevel,
+			preferredFastValue: source
+				? (source.configuredFastValue ?? source.fastValue)
+				: meta.fastValue,
+			preferredContextValue: source
+				? (source.configuredContextValue ?? source.contextValue)
+				: meta.contextValue,
+			preferredBackendSessionId: backendSessionId,
+			historyPromptPrefix,
+		});
+		const session = this.requireSession(sessionId);
+		await this.persistSessionMeta(session);
+
+		return await this.withDeferredSessionNotifications(session, async () => {
+			if (filePath) {
+				await this.replayStoredSessionHistory(session, filePath);
+			}
+			if (historyPromptPrefix) {
+				await this.emitNotice(
+					session,
+					"warning",
+					"Cursor context not copied",
+					"The adapter sends the visible history with the next prompt. Tool results and file contents from the earlier turns can be missing.",
+				);
+			}
+			return { ...this.buildResumeResponse(session, response), sessionId };
+		});
+	}
+
+	/** Returns the ID of the copied Cursor agent, or `undefined` when it was not copied. */
+	private async forkBackendSession(options: {
+		sourceSessionId: string;
+		sourceCwd: string;
+		sourceBackendSessionId: string | undefined;
+		cwd: string;
+	}): Promise<string | undefined> {
+		if (!options.sourceBackendSessionId || !this.runner.forkChat) {
+			return undefined;
+		}
+		try {
+			return await this.runner.forkChat({
+				backendSessionId: options.sourceBackendSessionId,
+				sourceWorkspace: options.sourceCwd,
+				workspace: options.cwd,
+			});
+		} catch (error) {
+			this.logger.error(
+				`[cursor-acp] Unable to copy the Cursor agent of session ${options.sourceSessionId}`,
+				error,
+			);
+			return undefined;
+		}
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -1345,6 +1440,7 @@ export class CursorAcpAgent implements Agent {
 		preferredFastValue?: string;
 		preferredContextValue?: string;
 		preferredBackendSessionId?: string;
+		historyPromptPrefix?: string;
 		warmNativeBackend?: boolean;
 	}): Promise<ExtendedNewSessionResponse> {
 		const modeId = params.preferredModeId ?? this.defaultModeId ?? DEFAULT_MODE_ID;
@@ -1370,7 +1466,9 @@ export class CursorAcpAgent implements Agent {
 			customSkills: [],
 			notificationsReady: false,
 			pendingNotifications: [],
+			backendSessionId: params.preferredBackendSessionId,
 			pendingNativeSessionId: params.preferredBackendSessionId,
+			historyPromptPrefix: params.historyPromptPrefix,
 		};
 
 		this.sessions[session.sessionId] = session;
@@ -2260,7 +2358,7 @@ export class CursorAcpAgent implements Agent {
 		const run = this.runner.startPrompt({
 			workspace: session.cwd,
 			backendSessionId: session.backendSessionId,
-			prompt: promptText,
+			prompt: (session.historyPromptPrefix ?? "") + promptText,
 			images,
 			modelId: session.modelId,
 			modeId: modeSettings.modeId,
@@ -2273,6 +2371,22 @@ export class CursorAcpAgent implements Agent {
 			onEvent: async (event) => {
 				if (event.type === "tool_call") {
 					toolsRan = true;
+				}
+				// Any model output means the model received the history; a retry must not resend it.
+				if (event.type !== "system" && event.type !== "result") {
+					session.historyPromptPrefix = undefined;
+				}
+				if (
+					event.type === "system" &&
+					event.subtype === "init" &&
+					typeof event.missing_session_id === "string"
+				) {
+					await this.emitNotice(
+						session,
+						"warning",
+						"Cursor session not restored",
+						"The saved Cursor agent was not found. The adapter started a new Cursor agent, so earlier context is missing.",
+					);
 				}
 				const turnUsage = turnUsageFromEvent(event);
 				if (turnUsage) {
@@ -2353,6 +2467,7 @@ export class CursorAcpAgent implements Agent {
 			}
 
 			if (subtype === "success" && !isError) {
+				session.historyPromptPrefix = undefined;
 				if (assistantTextChunks.length > 0) {
 					await recordAssistantMessage(
 						session.cwd,
