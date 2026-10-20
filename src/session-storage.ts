@@ -124,6 +124,8 @@ export async function recordSessionMeta(
 export async function readSessionMeta(filePath: string): Promise<{
 	cwd?: string;
 	backendSessionId?: string;
+	/** Every backend session ID the session used, oldest first. */
+	backendSessionIds?: string[];
 	modeId?: SessionModeId;
 	modelId?: string;
 	thinkingLevel?: string;
@@ -135,6 +137,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 		const lines = content.trim().split("\n").filter(Boolean);
 		let lastCwd: string | undefined;
 		let lastBackend: string | undefined;
+		const backendSessionIds = new Set<string>();
 		let lastModeId: SessionModeId | undefined;
 		let lastModelId: string | undefined;
 		let lastThinkingLevel: string | undefined;
@@ -160,6 +163,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 				}
 				if (entry.backendSessionId) {
 					lastBackend = entry.backendSessionId;
+					backendSessionIds.add(entry.backendSessionId);
 				}
 				if (typeof entry.modeId === "string") {
 					const normalizedModeId = normalizeModeId(entry.modeId);
@@ -186,6 +190,7 @@ export async function readSessionMeta(filePath: string): Promise<{
 		return {
 			cwd: lastCwd,
 			backendSessionId: lastBackend,
+			...(backendSessionIds.size > 0 ? { backendSessionIds: [...backendSessionIds] } : {}),
 			modeId: lastModeId,
 			modelId: lastModelId,
 			thinkingLevel: lastThinkingLevel,

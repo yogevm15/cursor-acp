@@ -13,6 +13,7 @@ import { CursorSdkRunner } from "../cursor-sdk-runner.js";
 const sdkMocks = vi.hoisted(() => ({
 	agentCreate: vi.fn(),
 	agentResume: vi.fn(),
+	agentGetUsage: vi.fn(),
 	modelList: vi.fn(),
 }));
 
@@ -22,7 +23,11 @@ const originalCommitAttribution = process.env[CURSOR_ACP_ATTRIBUTE_COMMITS_ENV];
 const originalPrAttribution = process.env[CURSOR_ACP_ATTRIBUTE_PRS_ENV];
 
 vi.mock("@cursor/sdk", () => ({
-	Agent: { create: sdkMocks.agentCreate, resume: sdkMocks.agentResume },
+	Agent: {
+		create: sdkMocks.agentCreate,
+		resume: sdkMocks.agentResume,
+		getUsage: sdkMocks.agentGetUsage,
+	},
 	Cursor: { models: { list: sdkMocks.modelList } },
 }));
 
@@ -174,6 +179,46 @@ describe("CursorSdkRunner", () => {
 
 		expect(sdkMocks.agentCreate).not.toHaveBeenCalled();
 		expect(result.exitCode).toBe(1);
+	});
+
+	it("reads the billed cost of real agents only", async () => {
+		sdkMocks.agentGetUsage.mockResolvedValue({
+			usage: {},
+			cost: { chargedCents: 12.5, rawCostCents: 40 },
+			runs: [],
+		});
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		await expect(runner.getChatCost("agent-real")).resolves.toEqual({
+			chargedCents: 12.5,
+			rawCostCents: 40,
+		});
+		await expect(runner.getChatCost(await runner.createChat())).resolves.toBeUndefined();
+
+		expect(sdkMocks.agentGetUsage).toHaveBeenCalledOnce();
+		expect(sdkMocks.agentGetUsage).toHaveBeenCalledWith("agent-real", { apiKey: "test-key" });
+	});
+
+	it("stops reading cost when the account does not have the feature", async () => {
+		sdkMocks.agentGetUsage.mockRejectedValue(
+			Object.assign(new Error("not available"), { code: "feature_unavailable" }),
+		);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		await expect(runner.getChatCost("agent-a")).resolves.toBeUndefined();
+		await expect(runner.getChatCost("agent-b")).resolves.toBeUndefined();
+
+		expect(sdkMocks.agentGetUsage).toHaveBeenCalledOnce();
+	});
+
+	it("returns no cost for a missing agent and rethrows other cost errors", async () => {
+		sdkMocks.agentGetUsage
+			.mockRejectedValueOnce(Object.assign(new Error("gone"), { code: "agent_not_found" }))
+			.mockRejectedValueOnce(Object.assign(new Error("offline"), { code: "network_error" }));
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		await expect(runner.getChatCost("agent-gone")).resolves.toBeUndefined();
+		await expect(runner.getChatCost("agent-a")).rejects.toThrow("offline");
 	});
 
 	it("forks only real agents, in the store of each workspace", async () => {

@@ -172,6 +172,7 @@ describe("session-storage", () => {
 			expect(meta).toEqual({
 				cwd,
 				backendSessionId: "backend-2",
+				backendSessionIds: ["backend-1", "backend-2"],
 				modeId: "yolo",
 				modelId: "gpt-5.2",
 			});

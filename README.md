@@ -23,6 +23,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - **Automatic retry for temporary failures**: When Cursor rate-limits a run or the connection drops, the adapter retries once a second, up to 30 times, and sends a notice when it starts retrying. Cancel stops the wait. If tools already ran, the retry asks the model to check the current state and continue instead of resending the prompt. Usage-limit, sign-in, and conversation-length errors are not retried. Each of these errors says what happened and whether earlier edits were kept, and the raw SDK error (code, request id, model) is logged to stderr.
 - **Model parameters**: Canonical SDK model IDs, thinking/reasoning/effort levels, fast values, context window sizes, and variants flow into SDK model selections. The adapter keeps the catalog's original parameter ids.
 - **Context window and token usage**: Models with an SDK `context` parameter (for example `272k` / `1m`) get a **Context** selector. After each turn, the adapter returns the turn's token counts in the ACP prompt response (`usage`) and sends a `usage_update` with the tokens in context and the window size.
+- **Session cost**: After each turn, and when a session is resumed or loaded, the adapter reads the billed cost of each SDK agent of the session (`Agent.getUsage`) and sends the total in `usage_update.cost`. `amount` is the amount Cursor charged, in USD (0 for usage included in your plan). `_meta.rawCostUsd` is the undiscounted model token cost. Cursor reports cost some seconds after a turn, so the adapter reads it again 10 s and 30 s after the turn. If the model has no `context` parameter, the update has `size: 0` (window size unknown). Cursor makes this data available only on some accounts. On other accounts the SDK returns `feature_unavailable`, and the adapter sends no cost.
 - **MCP and images**: ACP-provided stdio/HTTP/SSE MCP servers and image chunks are forwarded to the SDK.
 - **Agent, Plan, and Ask**: Plan uses the SDK's `plan` send mode. Ask creates a no-tools SDK agent.
 
@@ -44,7 +45,7 @@ This is an `ai-assisted` personal project aimed at bringing Cursor's agent into 
 - The SDK exposes no interactive per-tool approval callback. ACP approval therefore retries the complete turn without Auto Review; work completed before the blocked call may be repeated.
 - Auto Review reduces confirmation noise but is not a security boundary. Use sandboxing and normal least-privilege practices for untrusted workspaces.
 - `debug` mode is not exposed.
-- Context usage is an estimate. The SDK reports one token sum for all model calls in a turn, so for turns with tool calls the adapter estimates the size of the last call. `usage_update` is sent only for models that advertise a `context` parameter, because the SDK does not report the window size of other models.
+- Context usage is an estimate. The SDK reports one token sum for all model calls in a turn, so for turns with tool calls the adapter estimates the size of the last call. For models that do not advertise a `context` parameter, the SDK does not report the window size. Thus `usage_update` is sent for them only to carry the session cost, with `size: 0`.
 
 ## Breaking changes (SDK backend and Auto Review default)
 

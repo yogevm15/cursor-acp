@@ -55,6 +55,14 @@ export interface ForkChatOptions {
 	workspace: string;
 }
 
+/** Billed cost of one backend chat, in cents. */
+export interface ChatCost {
+	/** Amount actually charged; 0 for usage included in the plan. */
+	chargedCents: number;
+	/** Undiscounted model token cost. */
+	rawCostCents: number;
+}
+
 export interface CursorRunner {
 	listModels(): Promise<CursorModelDescriptor[]>;
 	createChat(): Promise<string>;
@@ -64,4 +72,9 @@ export interface CursorRunner {
 	 * source has no backend chat to copy. Runners that cannot copy chats omit this.
 	 */
 	forkChat?(options: ForkChatOptions): Promise<string | undefined>;
+	/**
+	 * Returns the billed cost of a backend chat, or `undefined` when the backend does not
+	 * report it. Runners without cost data omit this.
+	 */
+	getChatCost?(backendSessionId: string): Promise<ChatCost | undefined>;
 }

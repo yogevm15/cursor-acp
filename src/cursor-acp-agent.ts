@@ -55,7 +55,7 @@ import {
 	NativeSessionBackend,
 	NativeSessionCallbacks,
 } from "./cursor-native-acp-client.js";
-import type { CursorPromptRun, CursorRunner, RunPromptOptions } from "./cursor-runner.js";
+import type { ChatCost, CursorPromptRun, CursorRunner, RunPromptOptions } from "./cursor-runner.js";
 import { CursorSdkRunner } from "./cursor-sdk-runner.js";
 import type {
 	ExtendedNewSessionResponse,
@@ -157,6 +157,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 /** Delay before each automatic retry of a rate-limited or interrupted Cursor run. */
 const DEFAULT_PROMPT_RETRY_DELAYS_MS = Array.from({ length: 30 }, () => 1_000);
+/** Cursor reports cost some seconds after a turn ends, so the cost is read again later. */
+const DEFAULT_COST_REFRESH_DELAYS_MS = [0, 10_000, 30_000];
 
 function markdownEscape(text: string): string {
 	let fence = "```";
@@ -562,6 +564,14 @@ export interface SessionState {
 	backendSessionId?: string;
 	/** Earlier visible history for a forked session whose Cursor agent was not copied. */
 	historyPromptPrefix?: string;
+	/** Every backend chat of the session; the session cost is the sum of their costs. */
+	costChatIds: Set<string>;
+	/** Last read cost of each backend chat; `undefined` when the backend reported none. */
+	chatCosts: Map<string, ChatCost | undefined>;
+	/** Last session cost sent to the client. */
+	cost?: ChatCost;
+	/** Serializes cost reads for the session. */
+	costRefresh?: Promise<void>;
 	/** Populated from native `session/new` or `session/load` when available. */
 	nativeSessionModels?: LegacySessionModels;
 	/** Populated from the active runner's model catalog. */
@@ -593,6 +603,8 @@ export interface CursorAcpAgentOptions {
 	nativeCommand?: string;
 	/** Backoff before each automatic retry of a failed Cursor run; its length caps the retries. */
 	promptRetryDelaysMs?: readonly number[];
+	/** Delays after a turn at which the session cost is read. */
+	costRefreshDelaysMs?: readonly number[];
 }
 
 export class CursorAcpAgent implements Agent {
@@ -613,6 +625,7 @@ export class CursorAcpAgent implements Agent {
 	) => NativeSessionBackend;
 	private readonly nativeCommand?: string;
 	private readonly promptRetryDelaysMs: readonly number[];
+	private readonly costRefreshDelaysMs: readonly number[];
 
 	constructor(
 		private readonly client: CursorAcpClient,
@@ -623,6 +636,7 @@ export class CursorAcpAgent implements Agent {
 		this.auth = options.auth ?? new CursorAuth();
 		this.nativeCommand = options.nativeCommand;
 		this.promptRetryDelaysMs = options.promptRetryDelaysMs ?? DEFAULT_PROMPT_RETRY_DELAYS_MS;
+		this.costRefreshDelaysMs = options.costRefreshDelaysMs ?? DEFAULT_COST_REFRESH_DELAYS_MS;
 		this.createNativeClient =
 			options.createNativeClient ??
 			((nativeOptions, callbacks) => new CursorNativeAcpClient(nativeOptions, callbacks));
@@ -811,9 +825,11 @@ export class CursorAcpAgent implements Agent {
 			preferredFastValue: meta.fastValue,
 			preferredContextValue: meta.contextValue,
 			preferredBackendSessionId: meta.backendSessionId,
+			costChatIds: meta.backendSessionIds,
 		});
 
 		const session = this.requireSession(params.sessionId);
+		this.scheduleCostRefresh(session, [0]);
 
 		return await this.withDeferredSessionNotifications(session, async () => {
 			const notificationStartIndex = session.pendingNotifications.length;
@@ -919,9 +935,11 @@ export class CursorAcpAgent implements Agent {
 			preferredFastValue: meta.fastValue,
 			preferredContextValue: meta.contextValue,
 			preferredBackendSessionId: meta.backendSessionId,
+			costChatIds: meta.backendSessionIds,
 		});
 
 		const session = this.requireSession(params.sessionId);
+		this.scheduleCostRefresh(session, [0]);
 
 		return await this.withDeferredSessionNotifications(session, async () => {
 			const notificationStartIndex = session.pendingNotifications.length;
@@ -1059,6 +1077,7 @@ export class CursorAcpAgent implements Agent {
 			if (session.activeTurn === turn) {
 				session.activeTurn = undefined;
 			}
+			this.scheduleCostRefresh(session, this.costRefreshDelaysMs);
 		}
 	}
 
@@ -1208,24 +1227,89 @@ export class CursorAcpAgent implements Agent {
 				configOptions: response.configOptions,
 			},
 		});
-		await this.emitContextUsage(session);
+		await this.emitUsageUpdate(session);
 		return response;
 	}
 
-	/** Sends `usage_update` when both the window size and an estimate of used tokens are known. */
-	private async emitContextUsage(session: SessionState): Promise<void> {
-		const size = contextWindowTokens(session.contextValue);
-		if (size === undefined || session.contextTokensUsed === undefined) {
+	/**
+	 * Sends `usage_update` when the context usage or the session cost is known. A `size` of 0
+	 * means that the window size is unknown; it is sent only to carry the cost.
+	 */
+	private async emitUsageUpdate(session: SessionState): Promise<void> {
+		const windowSize = contextWindowTokens(session.contextValue);
+		const contextKnown = windowSize !== undefined && session.contextTokensUsed !== undefined;
+		if (!contextKnown && !session.cost) {
 			return;
 		}
+		const size = contextKnown ? windowSize : 0;
+		const used = session.contextTokensUsed ?? 0;
 		await this.emitOrQueueNotification(session, {
 			sessionId: session.sessionId,
 			update: {
 				sessionUpdate: "usage_update",
-				used: Math.min(session.contextTokensUsed, size),
+				used: contextKnown ? Math.min(used, size) : used,
 				size,
+				...(session.cost
+					? {
+							cost: {
+								amount: session.cost.chargedCents / 100,
+								currency: "USD",
+								_meta: { rawCostUsd: session.cost.rawCostCents / 100 },
+							},
+						}
+					: {}),
 			},
 		});
+	}
+
+	/** Reads the session cost after each delay and sends `usage_update` when it changes. */
+	private scheduleCostRefresh(session: SessionState, delaysMs: readonly number[]): void {
+		if (!this.runner.getChatCost || session.costChatIds.size === 0) {
+			return;
+		}
+		const previous = session.costRefresh ?? Promise.resolve();
+		const refresh = previous.then(async () => {
+			for (const delayMs of delaysMs) {
+				if (delayMs > 0) {
+					await sleep(delayMs);
+				}
+				if (this.sessions[session.sessionId] !== session) {
+					return;
+				}
+				await this.refreshSessionCost(session);
+			}
+		});
+		session.costRefresh = refresh.catch((error: unknown) => {
+			this.logger.warn?.("[cursor-acp] Unable to read the session cost", error);
+		});
+	}
+
+	private async refreshSessionCost(session: SessionState): Promise<void> {
+		for (const chatId of session.costChatIds) {
+			// Only the current chat gets new usage; costs of earlier chats are final.
+			if (chatId === session.backendSessionId || !session.chatCosts.has(chatId)) {
+				session.chatCosts.set(chatId, await this.runner.getChatCost!(chatId));
+			}
+		}
+
+		let total: ChatCost | undefined;
+		for (const cost of session.chatCosts.values()) {
+			if (cost) {
+				total = {
+					chargedCents: (total?.chargedCents ?? 0) + cost.chargedCents,
+					rawCostCents: (total?.rawCostCents ?? 0) + cost.rawCostCents,
+				};
+			}
+		}
+		if (
+			!total ||
+			(total.chargedCents === session.cost?.chargedCents &&
+				total.rawCostCents === session.cost?.rawCostCents)
+		) {
+			return;
+		}
+		session.cost = total;
+		await this.emitUsageUpdate(session);
 	}
 
 	private async setSessionConfigOptionLocked(
@@ -1441,6 +1525,8 @@ export class CursorAcpAgent implements Agent {
 		preferredContextValue?: string;
 		preferredBackendSessionId?: string;
 		historyPromptPrefix?: string;
+		/** Backend chats the session used before; defaults to the preferred backend chat. */
+		costChatIds?: string[];
 		warmNativeBackend?: boolean;
 	}): Promise<ExtendedNewSessionResponse> {
 		const modeId = params.preferredModeId ?? this.defaultModeId ?? DEFAULT_MODE_ID;
@@ -1469,6 +1555,11 @@ export class CursorAcpAgent implements Agent {
 			backendSessionId: params.preferredBackendSessionId,
 			pendingNativeSessionId: params.preferredBackendSessionId,
 			historyPromptPrefix: params.historyPromptPrefix,
+			costChatIds: new Set(
+				params.costChatIds ??
+					(params.preferredBackendSessionId ? [params.preferredBackendSessionId] : []),
+			),
+			chatCosts: new Map(),
 		};
 
 		this.sessions[session.sessionId] = session;
@@ -2395,7 +2486,7 @@ export class CursorAcpAgent implements Agent {
 						turnUsage,
 						session.contextTokensUsed,
 					);
-					await this.emitContextUsage(session);
+					await this.emitUsageUpdate(session);
 					return;
 				}
 
@@ -2407,6 +2498,7 @@ export class CursorAcpAgent implements Agent {
 
 				if (mapped.backendSessionId) {
 					session.backendSessionId = mapped.backendSessionId;
+					session.costChatIds.add(mapped.backendSessionId);
 					await this.persistSessionMeta(session);
 				}
 

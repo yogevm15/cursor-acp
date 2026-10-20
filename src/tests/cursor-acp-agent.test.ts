@@ -255,6 +255,7 @@ function createAgentTestHarness(
 		models?: CursorModelDescriptor[];
 		promptRetryDelaysMs?: number[];
 		forkChat?: TestCliRunner["forkChat"];
+		getChatCost?: TestCliRunner["getChatCost"];
 	} = {},
 ) {
 	const backends: FakeNativeBackend[] = [];
@@ -275,6 +276,7 @@ function createAgentTestHarness(
 			return "legacy-chat-1";
 		},
 		...(backendOptions.forkChat ? { forkChat: backendOptions.forkChat } : {}),
+		...(backendOptions.getChatCost ? { getChatCost: backendOptions.getChatCost } : {}),
 		async listModels() {
 			return (
 				backendOptions.models ?? [
@@ -335,6 +337,7 @@ function createAgentTestHarness(
 		},
 		runner,
 		promptRetryDelaysMs: backendOptions.promptRetryDelaysMs ?? [],
+		costRefreshDelaysMs: [0],
 		createNativeClient(options, callbacks) {
 			const backend = new FakeNativeBackend(
 				options,
@@ -2784,7 +2787,9 @@ describe("CursorAcpAgent", () => {
 		it("continues the same Cursor agent after an adapter restart", async () => {
 			const first = createAgentTestHarness();
 			await first.agent.initialize(initRequest());
-			const created = await first.agent.newSession(newSessionRequest({ cwd: "/tmp/project" }));
+			const created = await first.agent.newSession(
+				newSessionRequest({ cwd: "/tmp/project" }),
+			);
 			first.setLegacyPromptHandler(async (_prompt, { onEvent }) => {
 				await onEvent?.({ type: "system", subtype: "init", session_id: "agent-original" });
 				return {
@@ -2907,6 +2912,69 @@ describe("CursorAcpAgent", () => {
 			);
 			expect(legacyPromptCalls[0]!.promptText.endsWith("New message:\nand 3+3?")).toBe(true);
 			expect(legacyPromptCalls[1]!.promptText).toBe("and 4+4?");
+		});
+
+		function costUpdates(updates: SessionNotification[], sessionId: string) {
+			return updates
+				.filter(
+					(u) => u.sessionId === sessionId && u.update.sessionUpdate === "usage_update",
+				)
+				.map((u) => u.update);
+		}
+
+		async function waitForCostRefresh(agent: CursorAcpAgent, sessionId: string) {
+			await agentTestAccess(agent).sessions[sessionId]?.costRefresh;
+			await waitForScheduledUpdates();
+		}
+
+		it("sends the summed cost of every Cursor agent of a resumed session", async () => {
+			await seedSourceSession();
+			await recordSessionMeta("/tmp/source", "source", { backendSessionId: "agent-second" });
+			const costs: Record<string, { chargedCents: number; rawCostCents: number }> = {
+				"agent-source": { chargedCents: 100, rawCostCents: 300 },
+				"agent-second": { chargedCents: 25, rawCostCents: 50 },
+			};
+			const getChatCost = vi.fn(async (chatId: string) => costs[chatId]);
+			const { agent, client } = createAgentTestHarness({ getChatCost });
+			await agent.initialize(initRequest());
+
+			await agent.resumeSession({ sessionId: "source", cwd: "/tmp/source", mcpServers: [] });
+			await waitForCostRefresh(agent, "source");
+
+			expect(costUpdates(client.updates, "source")).toEqual([
+				{
+					sessionUpdate: "usage_update",
+					used: 0,
+					size: 0,
+					cost: { amount: 1.25, currency: "USD", _meta: { rawCostUsd: 3.5 } },
+				},
+			]);
+
+			costs["agent-second"] = { chargedCents: 75, rawCostCents: 150 };
+			await agent.prompt({ sessionId: "source", prompt: [{ type: "text", text: "more" }] });
+			await waitForCostRefresh(agent, "source");
+
+			const updates = costUpdates(client.updates, "source");
+			expect(updates[updates.length - 1]).toMatchObject({
+				cost: { amount: 1.75, currency: "USD", _meta: { rawCostUsd: 4.5 } },
+			});
+			// The cost of the earlier agent is final, so the adapter reads it only once.
+			expect(getChatCost.mock.calls.filter(([id]) => id === "agent-source")).toHaveLength(1);
+			expect(getChatCost.mock.calls.filter(([id]) => id === "agent-second")).toHaveLength(2);
+		});
+
+		it("sends no cost update when Cursor reports no cost", async () => {
+			await seedSourceSession();
+			const getChatCost = vi.fn(async () => undefined);
+			const { agent, client } = createAgentTestHarness({ getChatCost });
+			await agent.initialize(initRequest());
+
+			await agent.resumeSession({ sessionId: "source", cwd: "/tmp/source", mcpServers: [] });
+			await agent.prompt({ sessionId: "source", prompt: [{ type: "text", text: "more" }] });
+			await waitForCostRefresh(agent, "source");
+
+			expect(getChatCost).toHaveBeenCalled();
+			expect(costUpdates(client.updates, "source")).toEqual([]);
 		});
 
 		it("rejects a fork of an unknown session", async () => {

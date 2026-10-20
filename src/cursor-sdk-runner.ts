@@ -18,6 +18,7 @@ import {
 import { getCursorApiKey } from "./cursor-sdk-config.js";
 import { buildLocalAgentOptions } from "./cursor-sdk-local-options.js";
 import type {
+	ChatCost,
 	CursorPromptRun,
 	CursorRunner,
 	CursorStreamEvent,
@@ -110,6 +111,8 @@ function sdkMcpServers(
 
 export class CursorSdkRunner implements CursorRunner {
 	private readonly agents = new Map<string, ManagedAgent>();
+	/** Set when the account cannot read usage cost, so later calls skip the request. */
+	private costUnavailable = false;
 
 	constructor(
 		private readonly apiKey: string | undefined = getCursorApiKey(),
@@ -162,6 +165,30 @@ export class CursorSdkRunner implements CursorRunner {
 			workspace: options.workspace,
 			...(this.openStore ? { openStore: this.openStore } : {}),
 		});
+	}
+
+	async getChatCost(backendSessionId: string): Promise<ChatCost | undefined> {
+		if (this.costUnavailable || !isResumableAgentId(backendSessionId)) {
+			return undefined;
+		}
+		try {
+			const { cost } = await Agent.getUsage(
+				backendSessionId,
+				this.apiKey ? { apiKey: this.apiKey } : undefined,
+			);
+			return cost && { chargedCents: cost.chargedCents, rawCostCents: cost.rawCostCents };
+		} catch (error) {
+			const { errorCode } = sdkErrorDetails(error);
+			if (errorCode === "feature_unavailable") {
+				this.costUnavailable = true;
+				this.logger.warn?.("[cursor-acp] Usage cost is not available for this account");
+				return undefined;
+			}
+			if (errorCode === "agent_not_found") {
+				return undefined;
+			}
+			throw error;
+		}
 	}
 
 	startPrompt(options: RunPromptOptions): CursorPromptRun {
