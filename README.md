@@ -220,6 +220,8 @@ The mode picker lists **Auto-review**, **Yolo**, **Ask**, and **Plan**. Model-sp
 
 When you send a prompt while a turn is running, the adapter adds the text to the running turn (Cursor SDK steering). If the running turn cannot take the text, for example because the prompt has images, the prompt waits and runs as the next turn. `session/cancel` also cancels waiting prompts. Set `CURSOR_ACP_STEERING=0` to reject prompts during a running turn instead.
 
+JetBrains Air does not send a second `session/prompt` during a turn. It uses its own extension instead. The adapter declares `agentInfo._meta.steering.supported` in the `initialize` response, so Air enables **Send now** for queued messages. Air then sends `_session/steering` with `{ sessionId, prompt }`. If the running turn takes the text, the adapter answers `{ "outcome": "injected" }`. If not (no running turn, a slash command, images, or a turn that waits for approval), the adapter answers "method not found", and Air sends the message as the next turn.
+
 ### Client capabilities
 
 - **Notices** — clients that advertise `clientCapabilities.session.notices` receive `notice` updates for warnings such as a missing saved session, an Auto-review stop, a backend restart, or a Cursor rate-limit retry.

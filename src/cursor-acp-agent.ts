@@ -695,6 +695,8 @@ export class CursorAcpAgent implements Agent {
 				name: packageJson.name,
 				title: "Cursor SDK",
 				version: packageJson.version,
+				// JetBrains Air sends `_session/steering` only to agents that declare this.
+				...(isSteeringEnabled() ? { _meta: { steering: { supported: true } } } : {}),
 			},
 			authMethods,
 		};
@@ -1088,24 +1090,61 @@ export class CursorAcpAgent implements Agent {
 		promptImages: RunPromptOptions["images"],
 	): Promise<PromptResponse | undefined> {
 		const turn = session.activeTurn;
-		const steer = session.activeRun?.steer;
-		if (!turn || !steer || promptImages?.length) {
+		if (!turn || !(await this.injectIntoActiveTurn(session, promptText, promptImages))) {
 			return undefined;
+		}
+		const result = await turn;
+		return { stopReason: result.stopReason };
+	}
+
+	/** Adds the text to the running Cursor run. Returns `false` when the run did not take it. */
+	private async injectIntoActiveTurn(
+		session: SessionState,
+		promptText: string,
+		promptImages: RunPromptOptions["images"],
+	): Promise<boolean> {
+		const steer = session.activeRun?.steer;
+		if (!session.activeTurn || !steer || promptImages?.length) {
+			return false;
 		}
 
 		try {
 			if ((await steer(promptText)) !== "complete_delivered") {
-				return undefined;
+				return false;
 			}
 		} catch (error) {
 			this.logger.warn?.("[cursor-acp] Steering failed; queueing the prompt", error);
-			return undefined;
+			return false;
 		}
 
 		await recordUserMessage(session.cwd, session.sessionId, promptText);
 		await this.emitNotice(session, "info", "Message added to the running turn");
-		const result = await turn;
-		return { stopReason: result.stopReason };
+		return true;
+	}
+
+	/**
+	 * Handles the `_session/steering` extension of JetBrains Air: a message sent during a turn.
+	 * When the message cannot join the running turn, the answer is "method not found",
+	 * because that is the answer for which Air queues the message for the next turn.
+	 */
+	private async handleSteeringRequest(
+		method: string,
+		params: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		if (typeof params.sessionId !== "string" || !Array.isArray(params.prompt)) {
+			throw RequestError.invalidParams(undefined, "Steering needs a sessionId and a prompt");
+		}
+		const request = { sessionId: params.sessionId, prompt: params.prompt } as PromptRequest;
+		const session = this.requireSession(request.sessionId);
+		const promptText = promptToCursorText(request);
+		if (
+			isSteeringEnabled() &&
+			!parseLeadingSlashCommand(promptText).hasSlash &&
+			(await this.injectIntoActiveTurn(session, promptText, promptToCursorImages(request)))
+		) {
+			return { outcome: "injected" };
+		}
+		throw RequestError.methodNotFound(method);
 	}
 
 	private async runPromptTurn(
@@ -1488,6 +1527,9 @@ export class CursorAcpAgent implements Agent {
 				params as unknown as LegacySetSessionModelRequest,
 			);
 			return (response ?? {}) as Record<string, unknown>;
+		}
+		if (method === "_session/steering") {
+			return await this.handleSteeringRequest(method, params);
 		}
 
 		throw RequestError.methodNotFound(method);

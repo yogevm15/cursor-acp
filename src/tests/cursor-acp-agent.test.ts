@@ -2615,6 +2615,56 @@ describe("CursorAcpAgent", () => {
 			).toBe(true);
 		});
 
+		it("declares steering support to JetBrains Air in agentInfo", async () => {
+			const { agent } = createAgentTestHarness();
+			const enabled = await agent.initialize(initRequest());
+			process.env.CURSOR_ACP_STEERING = "0";
+			const disabled = await agent.initialize(initRequest());
+
+			expect(enabled.agentInfo?._meta).toEqual({ steering: { supported: true } });
+			expect(disabled.agentInfo?._meta).toBeUndefined();
+		});
+
+		it("injects a _session/steering message into the running turn", async () => {
+			const steered: string[] = [];
+			const { agent, session, first, releaseNext, legacyPromptCalls } =
+				await startBlockedTurn({
+					steer: async (text) => {
+						steered.push(text);
+						return "complete_delivered";
+					},
+				});
+
+			await expect(
+				agent.extMethod("_session/steering", {
+					sessionId: session.sessionId,
+					prompt: [{ type: "text", text: "also do this" }],
+				}),
+			).resolves.toEqual({ outcome: "injected" });
+
+			expect(steered).toEqual(["also do this"]);
+			await releaseNext();
+			await expect(first).resolves.toMatchObject({ stopReason: "end_turn" });
+			expect(legacyPromptCalls.map((call) => call.promptText)).toEqual(["run something"]);
+		});
+
+		it("answers method not found so Air queues a message that cannot join the turn", async () => {
+			const { agent, session, first, releaseNext } = await startBlockedTurn({
+				steer: async () => "revert_to_followup",
+			});
+			const steering = (text: string) =>
+				agent.extMethod("_session/steering", {
+					sessionId: session.sessionId,
+					prompt: [{ type: "text", text }],
+				});
+
+			await expect(steering("later")).rejects.toMatchObject({ code: -32601 });
+			await expect(steering("/model gpt-5.2")).rejects.toMatchObject({ code: -32601 });
+			await releaseNext();
+			await first;
+			await expect(steering("after the turn")).rejects.toMatchObject({ code: -32601 });
+		});
+
 		it("queues the prompt as a follow-up turn when steering is not possible", async () => {
 			const { agent, session, first, releaseNext, legacyPromptCalls } =
 				await startBlockedTurn();
