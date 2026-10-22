@@ -84,7 +84,7 @@ The same notice is linked from [`docs/breaking-changes.md`](docs/breaking-change
 | `/login`  | Authenticate with Cursor               |
 | `/logout` | Sign out of Cursor                     |
 
-Project and user slash commands/skills discovered by the adapter are added to the ACP command list.
+Project and user slash commands/skills discovered by the adapter are added to the ACP command list. Skills are found in every `.cursor/skills` and `.agents/skills` directory in the workspace, including nested ones (hidden directories and `node_modules` are skipped). A skill nearer to the workspace root overrides a nested skill with the same name.
 
 ## Installation
 
@@ -286,7 +286,8 @@ Oxlint and Oxfmt use their repository-level configurations. Source indentation u
 - `auto-review`, `yolo`, `ask`, and `plan` are the advertised modes
 - `default`, `acceptEdits`, `agent`, and `autoReview` are accepted as compatibility aliases for **`auto-review`**. For Yolo, use **`yolo`**—`bypassPermissions` and `autoRunAllCommands` are no longer accepted (see **Legacy Yolo mode name aliases removed**)
 - `debug` is not exposed
-- SDK user settings are loaded from Cursor's user setting source.
+- SDK settings are loaded from Cursor's user and project setting sources. The project source loads rules, skills, and `AGENTS.md` from the workspace, and it also enables project MCP servers and hooks in `.cursor/`.
+- Workspace roots: the session `cwd`, the ACP `additionalDirectories`, and, when `cwd` is not inside a Git repository, each direct subfolder that is a Git repository or has `.cursor`, `.agents`, or `AGENTS.md`. The SDK treats rules in a subfolder of `cwd` as nested rules: they apply when the agent works with files in that subfolder. To apply a rule in all chats, put it in `<cwd>/.cursor/rules/` (a symlink to a folder inside the workspace also works).
 
 ## Project Structure
 

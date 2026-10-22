@@ -14,6 +14,8 @@ export interface CursorStreamEvent {
 
 export interface RunPromptOptions {
 	workspace: string;
+	/** All workspace roots, `workspace` first. Project rules and skills load from each. */
+	workspaceRoots?: string[];
 	prompt: string;
 	images?: CursorPromptImage[];
 	backendSessionId?: string;

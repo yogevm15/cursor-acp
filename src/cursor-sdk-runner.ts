@@ -554,7 +554,7 @@ export class CursorSdkRunner implements CursorRunner {
 		return {
 			autoReview,
 			ask,
-			key: JSON.stringify({ autoReview, ask }),
+			key: JSON.stringify({ autoReview, ask, roots: options.workspaceRoots ?? [] }),
 		};
 	}
 
@@ -570,7 +570,11 @@ export class CursorSdkRunner implements CursorRunner {
 				options.fastValue,
 				options.contextValue,
 			),
-			local: buildLocalAgentOptions(options.workspace, config.autoReview),
+			local: buildLocalAgentOptions(
+				options.workspace,
+				config.autoReview,
+				options.workspaceRoots,
+			),
 			...(config.ask ? { tools: [] } : {}),
 			...(sdkMcpServers(options.mcpServers)
 				? { mcpServers: sdkMcpServers(options.mcpServers) }

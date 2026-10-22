@@ -4,6 +4,10 @@ import path from "node:path";
 
 export type SkillOrigin = "workspace" | "user" | "cursor";
 
+const WORKSPACE_CONFIG_DIR_NAMES = [".cursor", ".agents"];
+const SKIPPED_WORKSPACE_DIR_NAMES = new Set(["node_modules"]);
+const MAX_WORKSPACE_DIRS_SCANNED = 10_000;
+
 export interface CustomSkill {
 	name: string;
 	description: string;
@@ -132,13 +136,63 @@ async function readSkill(filePath: string, origin: SkillOrigin): Promise<CustomS
 	};
 }
 
+/**
+ * Find every `.cursor` and `.agents` directory under `workspace`, breadth-first so
+ * shallower directories come first. Hidden directories and `node_modules` are not
+ * searched, and symlinked directories are not followed. The scan stops after
+ * `maxDirs` directories so a huge workspace (such as a home directory) cannot stall
+ * session setup.
+ */
+export async function findWorkspaceConfigDirs(
+	workspace: string,
+	maxDirs: number = MAX_WORKSPACE_DIRS_SCANNED,
+): Promise<string[]> {
+	const found: string[] = [];
+	let scanned = 0;
+	let level = [workspace];
+	while (level.length > 0) {
+		const next: string[] = [];
+		for (const dir of level) {
+			if (scanned >= maxDirs) {
+				return found;
+			}
+			scanned += 1;
+			let entries: import("node:fs").Dirent[];
+			try {
+				entries = await fs.readdir(dir, { withFileTypes: true, encoding: "utf8" });
+			} catch {
+				continue;
+			}
+			entries.sort((a, b) => a.name.localeCompare(b.name));
+
+			const subdirs = entries.filter((entry) => entry.isDirectory());
+			for (const name of WORKSPACE_CONFIG_DIR_NAMES) {
+				if (subdirs.some((entry) => entry.name === name)) {
+					found.push(path.join(dir, name));
+				}
+			}
+			for (const entry of subdirs) {
+				if (entry.name.startsWith(".") || SKIPPED_WORKSPACE_DIR_NAMES.has(entry.name)) {
+					continue;
+				}
+				next.push(path.join(dir, entry.name));
+			}
+		}
+		level = next;
+	}
+	return found;
+}
+
 export async function loadCustomSkills(
 	workspace: string,
 	homeDirectory: string = os.homedir(),
 ): Promise<CustomSkill[]> {
+	const workspaceConfigDirs = await findWorkspaceConfigDirs(workspace);
 	const skillRoots: Array<{ root: string; origin: SkillOrigin }> = [
-		{ root: path.join(workspace, ".cursor", "skills"), origin: "workspace" },
-		{ root: path.join(workspace, ".agents", "skills"), origin: "workspace" },
+		...workspaceConfigDirs.map((dir) => ({
+			root: path.join(dir, "skills"),
+			origin: "workspace" as const,
+		})),
 		{ root: path.join(homeDirectory, ".agents", "skills"), origin: "user" },
 		{ root: path.join(homeDirectory, ".cursor", "skills"), origin: "user" },
 		{

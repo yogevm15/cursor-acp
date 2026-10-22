@@ -110,6 +110,31 @@ describe("CursorSdkRunner", () => {
 		);
 	});
 
+	it("loads user and project settings from every workspace root", async () => {
+		const agent = sdkAgent("agent-roots");
+		sdkMocks.agentCreate.mockResolvedValue(agent);
+		const runner = new CursorSdkRunner("test-key", logger);
+
+		await runner.startPrompt({
+			workspace: "/tmp/repos",
+			workspaceRoots: ["/tmp/repos", "/tmp/repos/core", "/tmp/repos/infra"],
+			prompt: "hello",
+		}).completed;
+		await runner.startPrompt({ workspace: "/tmp/project", prompt: "hello" }).completed;
+
+		expect(sdkMocks.agentCreate).toHaveBeenNthCalledWith(
+			1,
+			expect.objectContaining({
+				local: expect.objectContaining({
+					cwd: "/tmp/repos",
+					dirs: ["/tmp/repos", "/tmp/repos/core", "/tmp/repos/infra"],
+					settingSources: ["user", "project"],
+				}),
+			}),
+		);
+		expect(sdkMocks.agentCreate.mock.calls[1]?.[0].local).not.toHaveProperty("dirs");
+	});
+
 	it("resumes with Auto Review disabled for an approved retry without SDK force", async () => {
 		const reviewed = sdkAgent("agent-existing");
 		const approved = sdkAgent("agent-existing");

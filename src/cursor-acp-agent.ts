@@ -110,6 +110,7 @@ import {
 	resolveSkillSlashCommandPrompt,
 } from "./slash-commands.js";
 import { CustomSkill, loadCustomSkills } from "./skills.js";
+import { resolveWorkspaceRoots } from "./workspace-roots.js";
 import { SubagentTracker } from "./subagents.js";
 import {
 	AgentSessionModeId,
@@ -537,6 +538,8 @@ interface PromptAttemptResult {
 export interface SessionState {
 	sessionId: string;
 	cwd: string;
+	/** `cwd`, the client's additional directories, and projects found under `cwd`. */
+	workspaceRoots: string[];
 	mcpServers?: NewSessionRequest["mcpServers"];
 	modeId: SessionModeId;
 	modelId?: string;
@@ -689,6 +692,7 @@ export class CursorAcpAgent implements Agent {
 					fork: {},
 					resume: {},
 					list: {},
+					additionalDirectories: {},
 				},
 			},
 			agentInfo: {
@@ -707,6 +711,7 @@ export class CursorAcpAgent implements Agent {
 		return await this.createSession({
 			sessionId,
 			cwd: params.cwd,
+			additionalDirectories: params.additionalDirectories,
 			mcpServers: params.mcpServers,
 			preferredModeId: this.extractRequestedInitialMode(params),
 			preferredModelId: this.extractRequestedInitialModel(params),
@@ -755,6 +760,7 @@ export class CursorAcpAgent implements Agent {
 		const response = await this.createSession({
 			sessionId,
 			cwd: params.cwd,
+			additionalDirectories: params.additionalDirectories,
 			mcpServers: params.mcpServers ?? source?.mcpServers,
 			preferredModeId: source?.modeId ?? meta.modeId,
 			preferredModelId: source ? (source.configuredModelId ?? source.modelId) : meta.modelId,
@@ -820,6 +826,7 @@ export class CursorAcpAgent implements Agent {
 		const response = await this.createSession({
 			sessionId: params.sessionId,
 			cwd: params.cwd,
+			additionalDirectories: params.additionalDirectories,
 			mcpServers: params.mcpServers,
 			preferredModeId: meta.modeId,
 			preferredModelId: meta.modelId,
@@ -895,6 +902,7 @@ export class CursorAcpAgent implements Agent {
 	async loadSession(params: {
 		sessionId: string;
 		cwd: string;
+		additionalDirectories?: string[];
 		mcpServers?: NewSessionRequest["mcpServers"];
 	}): Promise<{
 		modes: NewSessionResponse["modes"];
@@ -910,6 +918,7 @@ export class CursorAcpAgent implements Agent {
 			const response = await this.createSession({
 				sessionId: params.sessionId,
 				cwd: params.cwd,
+				additionalDirectories: params.additionalDirectories,
 				mcpServers: params.mcpServers,
 			});
 			await this.emitNotice(
@@ -930,6 +939,7 @@ export class CursorAcpAgent implements Agent {
 		const response = await this.createSession({
 			sessionId: params.sessionId,
 			cwd: params.cwd,
+			additionalDirectories: params.additionalDirectories,
 			mcpServers: params.mcpServers,
 			preferredModeId: meta.modeId,
 			preferredModelId: meta.modelId,
@@ -1559,6 +1569,7 @@ export class CursorAcpAgent implements Agent {
 	private async createSession(params: {
 		sessionId: string;
 		cwd: string;
+		additionalDirectories?: string[];
 		mcpServers?: NewSessionRequest["mcpServers"];
 		preferredModeId?: SessionModeId;
 		preferredModelId?: string;
@@ -1579,6 +1590,10 @@ export class CursorAcpAgent implements Agent {
 		const session: SessionState = {
 			sessionId: params.sessionId,
 			cwd: params.cwd,
+			workspaceRoots: await this.resolveSessionWorkspaceRoots(
+				params.cwd,
+				params.additionalDirectories,
+			),
 			mcpServers: params.mcpServers,
 			modeId,
 			modelId: configuredModelId,
@@ -1633,6 +1648,18 @@ export class CursorAcpAgent implements Agent {
 				session.nativeSessionModels ?? fallbackModels,
 			),
 		};
+	}
+
+	private async resolveSessionWorkspaceRoots(
+		cwd: string,
+		additionalDirectories: string[] | undefined,
+	): Promise<string[]> {
+		try {
+			return await resolveWorkspaceRoots(cwd, additionalDirectories);
+		} catch (error) {
+			this.logger.warn?.("[cursor-acp] Unable to find workspace roots", error);
+			return [cwd, ...(additionalDirectories ?? [])];
+		}
 	}
 
 	private async loadSessionSlashExtensions(session: SessionState): Promise<void> {
@@ -2490,6 +2517,7 @@ export class CursorAcpAgent implements Agent {
 
 		const run = this.runner.startPrompt({
 			workspace: session.cwd,
+			workspaceRoots: session.workspaceRoots,
 			backendSessionId: session.backendSessionId,
 			prompt: (session.historyPromptPrefix ?? "") + promptText,
 			images,
