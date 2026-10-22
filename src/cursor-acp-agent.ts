@@ -110,6 +110,7 @@ import {
 	resolveSkillSlashCommandPrompt,
 } from "./slash-commands.js";
 import { CustomSkill, loadCustomSkills } from "./skills.js";
+import { adapterVersion } from "./version.js";
 import { resolveWorkspaceRoots } from "./workspace-roots.js";
 import { SubagentTracker } from "./subagents.js";
 import {
@@ -698,7 +699,7 @@ export class CursorAcpAgent implements Agent {
 			agentInfo: {
 				name: packageJson.name,
 				title: "Cursor SDK",
-				version: packageJson.version,
+				version: adapterVersion(),
 				// JetBrains Air sends `_session/steering` only to agents that declare this.
 				...(isSteeringEnabled() ? { _meta: { steering: { supported: true } } } : {}),
 			},

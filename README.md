@@ -75,14 +75,15 @@ The same notice is linked from [`docs/breaking-changes.md`](docs/breaking-change
 
 ## Slash Commands
 
-| Command   | Description                            |
-| --------- | -------------------------------------- |
-| `/help`   | Show available commands                |
-| `/model`  | Switch or display the current model    |
-| `/mode`   | Switch or display the current mode     |
-| `/status` | Show authentication and session status |
-| `/login`  | Authenticate with Cursor               |
-| `/logout` | Sign out of Cursor                     |
+| Command    | Description                                      |
+| ---------- | ------------------------------------------------ |
+| `/help`    | Show available commands                          |
+| `/model`   | Switch or display the current model              |
+| `/mode`    | Switch or display the current mode               |
+| `/status`  | Show authentication and session status           |
+| `/login`   | Authenticate with Cursor                         |
+| `/logout`  | Sign out of Cursor                               |
+| `/version` | Show adapter version, build time, and start time |
 
 Project and user slash commands/skills discovered by the adapter are added to the ACP command list. Skills are found in every `.cursor/skills` and `.agents/skills` directory in the workspace, including nested ones (hidden directories and `node_modules` are skipped). A skill nearer to the workspace root overrides a nested skill with the same name.
 

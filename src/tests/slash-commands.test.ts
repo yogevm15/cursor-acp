@@ -37,6 +37,21 @@ describe("slash commands", () => {
 		]);
 	});
 
+	it("handles /version with the build and start time", async () => {
+		const result = await handleSlashCommand("version", "", {
+			session: { modelId: "auto", modeId: "default" as const },
+			auth: mockAuth,
+			listModels: async () => [],
+		});
+
+		expect(result.handled).toBe(true);
+		expect(result.responseText).toMatch(/^@raphael\/cursor-acp \d+\.\d+\.\d+\nBuilt: \d{4}-/);
+		expect(result.responseText).toContain(`Process: ${process.pid}`);
+		expect(
+			availableSlashCommands().find((command) => command.name === "version")?.description,
+		).toMatch(/\(\d+\.\d+\.\d+\+\d{14}\)$/);
+	});
+
 	it("handles /model set", async () => {
 		const session = { modelId: "auto", modeId: "default" as const };
 		const result = await handleSlashCommand("model", "gpt-5.2", {

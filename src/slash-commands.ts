@@ -11,6 +11,7 @@ import {
 	SessionModeId,
 } from "./settings.js";
 import { CustomSkill, resolveSkillPrompt } from "./skills.js";
+import { adapterVersion, adapterVersionDetails } from "./version.js";
 
 export interface ModelParameterOption {
 	value: string;
@@ -84,6 +85,11 @@ const BUILTIN_SLASH_COMMANDS: AvailableCommand[] = [
 	{ name: "login", description: "Sign in to the Cursor SDK", input: null },
 	{ name: "logout", description: "Sign out of the Cursor SDK", input: null },
 	{ name: "status", description: "Show login status", input: null },
+	{
+		name: "version",
+		description: `Show adapter version and build time (${adapterVersion()})`,
+		input: null,
+	},
 ];
 
 const NATIVE_PASSTHROUGH_SLASH_COMMANDS: AvailableCommand[] = [
@@ -452,6 +458,9 @@ export async function handleSlashCommand(
 					.map(formatSlashCommand)
 					.join(", ")}`,
 			};
+
+		case "version":
+			return { handled: true, responseText: adapterVersionDetails() };
 
 		case "status": {
 			const status = await context.auth.status();
