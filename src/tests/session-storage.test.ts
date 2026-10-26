@@ -6,6 +6,7 @@ import {
 	buildHistoryPromptPrefix,
 	copySessionHistory,
 	encodeProjectPath,
+	findHistoryForkPoint,
 	sessionFilePath,
 	ensureSessionDir,
 	appendSessionEntry,
@@ -204,6 +205,52 @@ describe("session-storage", () => {
 				{ type: "assistant", sessionId: "fork", cwd },
 			]);
 			expect(await readSessionMeta(sessionFilePath(cwd, "fork"))).toEqual({});
+		});
+
+		it("copies the messages up to a fork point and keeps their message ids", async () => {
+			const sourceCwd = "/Users/test/source";
+			const cwd = "/Users/test/fork";
+			const sourceFilePath = sessionFilePath(sourceCwd, "source");
+			await recordUserMessage(sourceCwd, "source", "One");
+			await recordAssistantMessage(sourceCwd, "source", "1");
+			await recordUserMessage(sourceCwd, "source", "Two");
+			await recordAssistantMessage(sourceCwd, "source", "2", "reply-2");
+			await recordUserMessage(sourceCwd, "source", "Three");
+			await recordAssistantMessage(sourceCwd, "source", "3", "reply-3");
+
+			expect(await findHistoryForkPoint(sourceFilePath, "source", "reply-2")).toEqual({
+				messageCount: 4,
+				latest: false,
+			});
+			expect(await findHistoryForkPoint(sourceFilePath, "source", "reply-3")).toEqual({
+				messageCount: 6,
+				latest: true,
+			});
+			expect(await findHistoryForkPoint(sourceFilePath, "source", "history-1")).toEqual({
+				messageCount: 2,
+				latest: false,
+			});
+			expect(await findHistoryForkPoint(sourceFilePath, "source", "missing")).toBeUndefined();
+
+			await copySessionHistory({
+				sourceFilePath,
+				sourceSessionId: "source",
+				cwd,
+				sessionId: "fork",
+				messageCount: 4,
+			});
+
+			const entries = fs
+				.readFileSync(sessionFilePath(cwd, "fork"), "utf-8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			expect(entries.map((entry) => [entry.message.content, entry.messageId])).toEqual([
+				["One", undefined],
+				["1", "history-1"],
+				["Two", undefined],
+				["2", "reply-2"],
+			]);
 		});
 	});
 
@@ -436,6 +483,28 @@ describe("session-storage", () => {
 			expect(notifications).toHaveLength(2);
 			expect(notifications[0].update.sessionUpdate).toBe("user_message_chunk");
 			expect(notifications[1].update.sessionUpdate).toBe("agent_message_chunk");
+		});
+
+		it("sends the stored message id of each assistant message", async () => {
+			const cwd = "/Users/test/project";
+			const sessionId = "test-session";
+			await recordUserMessage(cwd, sessionId, "Hello");
+			await recordAssistantMessage(cwd, sessionId, "Hi there");
+			await recordUserMessage(cwd, sessionId, "Again");
+			await recordAssistantMessage(cwd, sessionId, "Hi again", "reply-2");
+
+			const notifications: SessionNotification[] = [];
+			await replaySessionHistory({
+				sessionId,
+				filePath: sessionFilePath(cwd, sessionId),
+				sendNotification: async (notification) => {
+					notifications.push(notification);
+				},
+			});
+
+			expect(
+				notifications.map((n) => (n.update as { messageId?: string }).messageId),
+			).toEqual([undefined, "history-1", undefined, "reply-2"]);
 		});
 
 		it("skips entries with mismatched sessionId", async () => {

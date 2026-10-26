@@ -24,6 +24,7 @@ import type { CursorAcpClient } from "../cursor-acp-client.js";
 import type { RunPromptOptions } from "../cursor-cli-runner.js";
 import type { SteerOutcome } from "../cursor-runner.js";
 import {
+	findHistoryForkPoint,
 	readSessionMeta,
 	recordAssistantMessage,
 	recordSessionMeta,
@@ -2962,6 +2963,128 @@ describe("CursorAcpAgent", () => {
 			);
 			expect(legacyPromptCalls[0]!.promptText.endsWith("New message:\nand 3+3?")).toBe(true);
 			expect(legacyPromptCalls[1]!.promptText).toBe("and 4+4?");
+		});
+
+		it("gives each reply a message id that Air can fork at", async () => {
+			const { agent, client, setLegacyPromptHandler } = createAgentTestHarness();
+			await agent.initialize(initRequest());
+			const session = await agent.newSession(newSessionRequest({ cwd: "/tmp/project" }));
+			setLegacyPromptHandler(async (_prompt, { onEvent }) => {
+				for (const text of ["Hello", " there"]) {
+					await onEvent?.({
+						type: "assistant",
+						message: { content: [{ type: "text", text }] },
+					});
+				}
+				return {
+					events: [],
+					resultEvent: { type: "result", subtype: "success", is_error: false },
+					stderr: "",
+					exitCode: 0,
+				};
+			});
+			await agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "hi" }],
+			});
+			await agent.prompt({
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "hi" }],
+			});
+
+			const messageIds = client.updates
+				.filter((u) => u.update.sessionUpdate === "agent_message_chunk")
+				.map((u) => (u.update as { messageId?: string }).messageId);
+			expect(messageIds).toHaveLength(4);
+			expect(messageIds[0]).toEqual(expect.any(String));
+			expect(messageIds[1]).toBe(messageIds[0]);
+			expect(messageIds[2]).not.toBe(messageIds[0]);
+			expect(messageIds[3]).toBe(messageIds[2]);
+
+			const filePath = sessionFilePath("/tmp/project", session.sessionId);
+			expect(await findHistoryForkPoint(filePath, session.sessionId, messageIds[0]!)).toEqual(
+				{
+					messageCount: 2,
+					latest: false,
+				},
+			);
+		});
+
+		function airFork(messageId: string) {
+			return { jetbrains: { air: { fork: { version: 1, messageId } } } };
+		}
+
+		async function seedTwoTurnSession() {
+			await seedSourceSession();
+			await recordUserMessage("/tmp/source", "source", "And 3+3?");
+			await recordAssistantMessage("/tmp/source", "source", "6", "reply-2");
+		}
+
+		it("forks at an earlier Air turn with only the history up to that turn", async () => {
+			await seedTwoTurnSession();
+			const forkChat = vi.fn(async () => "agent-fork");
+			const { agent, client, legacyPromptCalls } = createAgentTestHarness({ forkChat });
+			await agent.initialize(initRequest({ clientCapabilities: noticeCapabilities }));
+
+			const forked = await agent.unstable_forkSession({
+				sessionId: "source",
+				cwd: "/tmp/fork",
+				_meta: airFork("history-1:segment:0"),
+			});
+			await waitForScheduledUpdates();
+
+			expect(forkChat).not.toHaveBeenCalled();
+			const replayed = client.updates.filter(
+				(u) =>
+					u.sessionId === forked.sessionId &&
+					(u.update.sessionUpdate === "user_message_chunk" ||
+						u.update.sessionUpdate === "agent_message_chunk"),
+			);
+			expect(
+				replayed.map((u) => (u.update as { content: { text: string } }).content.text),
+			).toEqual(["What is 2+2?", "4"]);
+			expect(noticeTitles(client.updates, forked.sessionId)).toEqual([
+				"Cursor context not copied",
+			]);
+
+			await agent.prompt({
+				sessionId: forked.sessionId,
+				prompt: [{ type: "text", text: "and 5+5?" }],
+			});
+			expect(legacyPromptCalls[0]!.promptText).toContain("Assistant:\n4\n");
+			expect(legacyPromptCalls[0]!.promptText).not.toContain("3+3");
+		});
+
+		it("copies the Cursor agent when Air forks at the last turn", async () => {
+			await seedTwoTurnSession();
+			const forkChat = vi.fn(async () => "agent-fork");
+			const { agent } = createAgentTestHarness({ forkChat });
+			await agent.initialize(initRequest());
+
+			const forked = await agent.unstable_forkSession({
+				sessionId: "source",
+				cwd: "/tmp/fork",
+				_meta: airFork("reply-2"),
+			});
+
+			expect(forkChat).toHaveBeenCalledOnce();
+			expect(
+				await readSessionMeta(sessionFilePath("/tmp/fork", forked.sessionId)),
+			).toMatchObject({ backendSessionId: "agent-fork" });
+		});
+
+		it("rejects an Air fork at a message that the session does not have", async () => {
+			await seedTwoTurnSession();
+			const { agent } = createAgentTestHarness({ forkChat: vi.fn() });
+			await agent.initialize(initRequest());
+
+			await expect(
+				agent.unstable_forkSession({
+					sessionId: "source",
+					cwd: "/tmp/fork",
+					_meta: airFork("unknown"),
+				}),
+			).rejects.toThrow("Invalid params");
 		});
 
 		function costUpdates(updates: SessionNotification[], sessionId: string) {

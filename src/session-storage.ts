@@ -16,6 +16,8 @@ export interface SessionHistoryEntry {
 	timestamp: string;
 	sessionId: string;
 	cwd?: string;
+	/** The ACP `messageId` of an assistant reply; also the fork point that clients send. */
+	messageId?: string;
 	message: {
 		role: "user" | "assistant";
 		content: string | unknown[];
@@ -231,12 +233,14 @@ export async function recordAssistantMessage(
 	cwd: string,
 	sessionId: string,
 	content: string | unknown[],
+	messageId?: string,
 ): Promise<void> {
 	const entry: SessionHistoryEntry = {
 		type: "assistant",
 		timestamp: new Date().toISOString(),
 		sessionId,
 		cwd,
+		...(messageId ? { messageId } : {}),
 		message: {
 			role: "assistant",
 			content,
@@ -468,10 +472,20 @@ interface StoredHistoryMessage {
 	entry: SessionHistoryEntry;
 	role: "user" | "assistant";
 	text: string;
+	/** Set for assistant messages. */
+	messageId?: string;
 }
 
-/** Parses one JSONL line; returns `undefined` for metadata, other sessions, and bad lines. */
-function parseHistoryMessage(line: string, sessionId: string): StoredHistoryMessage | undefined {
+/**
+ * Parses one JSONL line; returns `undefined` for metadata, other sessions, and bad lines.
+ * `index` is the position of the message in the history. It gives an assistant message
+ * that was stored without an ID the same ID at each replay.
+ */
+function parseHistoryMessage(
+	line: string,
+	sessionId: string,
+	index: number,
+): StoredHistoryMessage | undefined {
 	const trimmed = line.trim();
 	if (!trimmed) {
 		return undefined;
@@ -527,7 +541,14 @@ function parseHistoryMessage(line: string, sessionId: string): StoredHistoryMess
 					})
 					.join("");
 
-	return { entry, role, text };
+	if (role === "user") {
+		return { entry, role, text };
+	}
+	const messageId =
+		typeof entry.messageId === "string" && entry.messageId
+			? entry.messageId
+			: `history-${index}`;
+	return { entry, role, text, messageId };
 }
 
 async function readHistoryMessages(
@@ -537,7 +558,7 @@ async function readHistoryMessages(
 	const content = await fs.promises.readFile(filePath, "utf-8");
 	const messages: StoredHistoryMessage[] = [];
 	for (const line of content.split("\n")) {
-		const message = parseHistoryMessage(line, sessionId);
+		const message = parseHistoryMessage(line, sessionId, messages.length);
 		if (message) {
 			messages.push(message);
 		}
@@ -557,12 +578,14 @@ export async function replaySessionHistory(options: ReplayOptions): Promise<void
 		crlfDelay: Infinity,
 	});
 
+	let index = 0;
 	try {
 		for await (const line of reader) {
-			const message = parseHistoryMessage(line, sessionId);
+			const message = parseHistoryMessage(line, sessionId, index);
 			if (!message) {
 				continue;
 			}
+			index++;
 
 			await sendNotification({
 				sessionId,
@@ -573,6 +596,7 @@ export async function replaySessionHistory(options: ReplayOptions): Promise<void
 						type: "text",
 						text: message.text,
 					},
+					...(message.messageId ? { messageId: message.messageId } : {}),
 				},
 			});
 		}
@@ -582,20 +606,46 @@ export async function replaySessionHistory(options: ReplayOptions): Promise<void
 }
 
 /**
- * Copies the visible history of one session into a new session file. Session metadata is
- * not copied; the caller records it for the new session.
+ * Finds the assistant message where a fork ends. Returns the number of history messages
+ * up to and including it, and whether it is the last message, or `undefined` when the
+ * history has no assistant message with this ID.
+ */
+export async function findHistoryForkPoint(
+	filePath: string,
+	sessionId: string,
+	messageId: string,
+): Promise<{ messageCount: number; latest: boolean } | undefined> {
+	const messages = await readHistoryMessages(filePath, sessionId);
+	for (let index = messages.length - 1; index >= 0; index--) {
+		if (messages[index]!.messageId === messageId) {
+			return { messageCount: index + 1, latest: index === messages.length - 1 };
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Copies the visible history of one session into a new session file, or only its first
+ * `messageCount` messages. Session metadata is not copied; the caller records it for the
+ * new session.
  */
 export async function copySessionHistory(options: {
 	sourceFilePath: string;
 	sourceSessionId: string;
 	cwd: string;
 	sessionId: string;
+	messageCount?: number;
 }): Promise<void> {
 	const messages = await readHistoryMessages(options.sourceFilePath, options.sourceSessionId);
 	await ensureSessionDir(options.cwd);
-	const lines = messages.map(
-		({ entry }) =>
-			JSON.stringify({ ...entry, sessionId: options.sessionId, cwd: options.cwd }) + "\n",
+	const lines = messages.slice(0, options.messageCount).map(
+		({ entry, messageId }) =>
+			JSON.stringify({
+				...entry,
+				sessionId: options.sessionId,
+				cwd: options.cwd,
+				...(messageId ? { messageId } : {}),
+			}) + "\n",
 	);
 	await fs.promises.writeFile(sessionFilePath(options.cwd, options.sessionId), lines.join(""), {
 		encoding: "utf-8",

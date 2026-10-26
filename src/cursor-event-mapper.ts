@@ -29,6 +29,8 @@ export interface MappingContext {
 	sessionId: string;
 	toolUseCache: Record<string, CachedToolUse>;
 	logger?: Logger;
+	/** The ACP `messageId` of the assistant reply. */
+	messageId?: string;
 }
 
 export interface MappingResult {
@@ -176,6 +178,7 @@ export function mapCursorEventToAcp(
 						type: "text",
 						text,
 					},
+					...(context.messageId ? { messageId: context.messageId } : {}),
 				},
 			});
 		}

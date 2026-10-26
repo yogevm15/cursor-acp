@@ -129,6 +129,7 @@ import {
 import {
 	buildHistoryPromptPrefix,
 	copySessionHistory,
+	findHistoryForkPoint,
 	findSessionFile,
 	getCursorAcpConfigDir,
 	listSessions,
@@ -513,6 +514,19 @@ function contextCandidatesFrom(raw: LooseSessionDefaults): unknown[] {
 	];
 }
 
+/**
+ * The ID of the assistant message after which JetBrains Air forks a session, from
+ * `_meta.jetbrains.air.fork`. Older Air builds append `:segment:<n>` to the ID.
+ */
+function airForkMessageId(meta: ForkSessionRequest["_meta"]): string | undefined {
+	const air = isObject(meta?.jetbrains) ? meta.jetbrains.air : undefined;
+	const fork = isObject(air) ? air.fork : undefined;
+	if (!isObject(fork) || fork.version !== 1 || typeof fork.messageId !== "string") {
+		return undefined;
+	}
+	return fork.messageId.trim().replace(/:segment:\d+$/, "") || undefined;
+}
+
 function promptResponse(
 	stopReason: PromptResponse["stopReason"],
 	usage: Usage | undefined,
@@ -724,7 +738,8 @@ export class CursorAcpAgent implements Agent {
 
 	/**
 	 * Copies the source session's Cursor agent and visible history to a new session. When the
-	 * agent cannot be copied, the next prompt carries the visible history instead.
+	 * agent cannot be copied, the next prompt carries the visible history instead. A JetBrains
+	 * Air fork point ends the copied history at that assistant message.
 	 */
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
 		const source = this.sessions[params.sessionId];
@@ -735,14 +750,29 @@ export class CursorAcpAgent implements Agent {
 		const meta = sourceFilePath ? await readSessionMeta(sourceFilePath) : {};
 		const sourceCwd = source?.cwd ?? meta.cwd ?? params.cwd;
 		const sourceBackendSessionId = source ? source.backendSessionId : meta.backendSessionId;
+		const forkMessageId = airForkMessageId(params._meta);
+		const forkPoint =
+			forkMessageId && sourceFilePath
+				? await findHistoryForkPoint(sourceFilePath, params.sessionId, forkMessageId)
+				: undefined;
+		if (forkMessageId && !forkPoint) {
+			throw RequestError.invalidParams(
+				{ messageId: forkMessageId },
+				`Fork point message ${forkMessageId} was not found in session ${params.sessionId}`,
+			);
+		}
 
 		const sessionId = randomUUID();
-		const backendSessionId = await this.forkBackendSession({
-			sourceSessionId: params.sessionId,
-			sourceCwd,
-			sourceBackendSessionId,
-			cwd: params.cwd,
-		});
+		// The copied Cursor agent holds every turn, so a fork before the last turn cannot use it.
+		const backendSessionId =
+			forkPoint && !forkPoint.latest
+				? undefined
+				: await this.forkBackendSession({
+						sourceSessionId: params.sessionId,
+						sourceCwd,
+						sourceBackendSessionId,
+						cwd: params.cwd,
+					});
 		let filePath: string | undefined;
 		if (sourceFilePath) {
 			await copySessionHistory({
@@ -750,6 +780,7 @@ export class CursorAcpAgent implements Agent {
 				sourceSessionId: params.sessionId,
 				cwd: params.cwd,
 				sessionId,
+				messageCount: forkPoint?.messageCount,
 			});
 			filePath = sessionFilePath(params.cwd, sessionId);
 		}
@@ -1017,6 +1048,7 @@ export class CursorAcpAgent implements Agent {
 					}
 
 					if (handled.responseText) {
+						const messageId = randomUUID();
 						await this.client.sessionUpdate({
 							sessionId: session.sessionId,
 							update: {
@@ -1025,12 +1057,14 @@ export class CursorAcpAgent implements Agent {
 									type: "text",
 									text: handled.responseText,
 								},
+								messageId,
 							},
 						});
 						await recordAssistantMessage(
 							session.cwd,
 							session.sessionId,
 							handled.responseText,
+							messageId,
 						);
 					}
 
@@ -1165,11 +1199,14 @@ export class CursorAcpAgent implements Agent {
 	): Promise<PromptResponse> {
 		session.cancelled = false;
 		await recordUserMessage(session.cwd, session.sessionId, promptText);
+		// One ID for the whole reply, so that a retry continues the same message.
+		const messageId = randomUUID();
 		const firstAttempt = await this.runPromptAttemptWithRetries(
 			session,
 			promptText,
 			promptImages,
 			false,
+			messageId,
 		);
 
 		if (firstAttempt.stopReason === "cancelled" || session.cancelled) {
@@ -1214,6 +1251,7 @@ export class CursorAcpAgent implements Agent {
 					promptText,
 					promptImages,
 					true,
+					messageId,
 				);
 				return promptResponse(
 					retry.stopReason,
@@ -2506,6 +2544,7 @@ export class CursorAcpAgent implements Agent {
 		promptText: string,
 		images: RunPromptOptions["images"],
 		forceRetry: boolean,
+		messageId: string,
 	): Promise<PromptAttemptResult> {
 		const rejectedToolCalls: RejectedToolCall[] = [];
 		const toolUseCache: Record<string, CachedToolUse> = {};
@@ -2566,6 +2605,7 @@ export class CursorAcpAgent implements Agent {
 					sessionId: session.sessionId,
 					toolUseCache,
 					logger: this.logger,
+					messageId,
 				});
 
 				if (mapped.backendSessionId) {
@@ -2637,6 +2677,7 @@ export class CursorAcpAgent implements Agent {
 						session.cwd,
 						session.sessionId,
 						assistantTextChunks.join(""),
+						messageId,
 					);
 				}
 				return {
@@ -2686,12 +2727,19 @@ export class CursorAcpAgent implements Agent {
 		promptText: string,
 		images: RunPromptOptions["images"],
 		forceRetry: boolean,
+		messageId: string,
 	): Promise<PromptAttemptResult> {
 		let toolsRan = false;
 		for (let retries = 0; ; retries++) {
 			const attemptPrompt = toolsRan ? continuationPrompt(promptText) : promptText;
 			try {
-				return await this.runPromptAttempt(session, attemptPrompt, images, forceRetry);
+				return await this.runPromptAttempt(
+					session,
+					attemptPrompt,
+					images,
+					forceRetry,
+					messageId,
+				);
 			} catch (error) {
 				if (!(error instanceof CursorRunError)) {
 					throw error;
