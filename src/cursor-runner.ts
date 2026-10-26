@@ -17,6 +17,8 @@ export interface RunPromptOptions {
 	/** All workspace roots, `workspace` first. Project rules and skills load from each. */
 	workspaceRoots?: string[];
 	prompt: string;
+	/** Added before `prompt` only when the runner starts a new backend chat. */
+	newChatPromptPrefix?: string;
 	images?: CursorPromptImage[];
 	backendSessionId?: string;
 	modelId?: string;

@@ -286,7 +286,7 @@ export class CursorSdkRunner implements CursorRunner {
 				return { events, resultEvent, stderr, exitCode: 0 };
 			}
 			agent = agentOutcome.value.agent;
-			const { missingAgentId } = agentOutcome.value;
+			const { missingAgentId, created } = agentOutcome.value;
 			await emit({
 				type: "system",
 				subtype: "init",
@@ -331,9 +331,13 @@ export class CursorSdkRunner implements CursorRunner {
 						: "run-everything",
 			);
 
+			const prompt =
+				created && options.newChatPromptPrefix
+					? `${options.newChatPromptPrefix}\n\n${options.prompt}`
+					: options.prompt;
 			const message = options.images?.length
-				? { text: options.prompt, images: options.images }
-				: options.prompt;
+				? { text: prompt, images: options.images }
+				: prompt;
 			const sendCompleted = agent.send(message, sendOptions);
 			const sendOutcome = await this.completeOperation(sendCompleted, hooks, agent);
 			if (sendOutcome.cancelled && (!sendOutcome.settled || !sendOutcome.succeeded)) {
@@ -582,17 +586,20 @@ export class CursorSdkRunner implements CursorRunner {
 		};
 	}
 
-	/** `missingAgentId` is set when the requested agent was not found and a new one was made. */
+	/**
+	 * `created` is true when a new SDK agent was made. `missingAgentId` is set when the
+	 * requested agent was not found and a new one was made.
+	 */
 	private async resolveAgent(
 		options: RunPromptOptions,
-	): Promise<{ agent: SDKAgent; missingAgentId?: string }> {
+	): Promise<{ agent: SDKAgent; created: boolean; missingAgentId?: string }> {
 		const backendSessionId = options.backendSessionId;
 		const configKey = this.agentConfig(options).key;
 		let missingAgentId: string | undefined;
 		if (backendSessionId) {
 			const cached = this.agents.get(backendSessionId);
 			if (cached && cached.cwd === options.workspace && cached.configKey === configKey) {
-				return { agent: cached.agent };
+				return { agent: cached.agent, created: false };
 			}
 			if (cached) {
 				cached.agent.close();
@@ -607,7 +614,7 @@ export class CursorSdkRunner implements CursorRunner {
 						cwd: options.workspace,
 						configKey,
 					});
-					return { agent };
+					return { agent, created: false };
 				} catch (error) {
 					if (sdkErrorDetails(error).errorCode !== "agent_not_found") {
 						throw error;
@@ -626,6 +633,6 @@ export class CursorSdkRunner implements CursorRunner {
 			this.agents.delete(backendSessionId);
 		}
 		this.agents.set(agent.agentId, { agent, cwd: options.workspace, configKey });
-		return { agent, ...(missingAgentId ? { missingAgentId } : {}) };
+		return { agent, created: true, ...(missingAgentId ? { missingAgentId } : {}) };
 	}
 }

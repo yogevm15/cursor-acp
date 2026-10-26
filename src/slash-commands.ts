@@ -10,7 +10,7 @@ import {
 	normalizeModeId,
 	SessionModeId,
 } from "./settings.js";
-import { CustomSkill, resolveSkillPrompt } from "./skills.js";
+import { CustomSkill, parseFrontmatter, resolveSkillPrompt } from "./skills.js";
 import { adapterVersion, adapterVersionDetails } from "./version.js";
 
 export interface ModelParameterOption {
@@ -222,46 +222,6 @@ async function collectMarkdownFiles(dir: string): Promise<string[]> {
 	}
 
 	return files;
-}
-
-function parseFrontmatter(markdown: string): {
-	metadata: Record<string, string>;
-	body: string;
-} {
-	const lines = markdown.split(/\r?\n/);
-	if (lines[0]?.trim() !== "---") {
-		return { metadata: {}, body: markdown };
-	}
-
-	let end = -1;
-	for (let i = 1; i < lines.length; i += 1) {
-		if (lines[i]?.trim() === "---") {
-			end = i;
-			break;
-		}
-	}
-
-	if (end === -1) {
-		return { metadata: {}, body: markdown };
-	}
-
-	const metadata: Record<string, string> = {};
-	for (const line of lines.slice(1, end)) {
-		const delimiter = line.indexOf(":");
-		if (delimiter <= 0) {
-			continue;
-		}
-		const key = line.slice(0, delimiter).trim().toLowerCase();
-		const value = line.slice(delimiter + 1).trim();
-		if (key && value) {
-			metadata[key] = value;
-		}
-	}
-
-	return {
-		metadata,
-		body: lines.slice(end + 1).join("\n"),
-	};
 }
 
 function firstHeading(markdown: string): string | undefined {

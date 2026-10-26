@@ -50,7 +50,8 @@ async function collectSkillFiles(dir: string): Promise<string[]> {
 	return files;
 }
 
-function parseFrontmatter(markdown: string): {
+/** Reads top-level `key: value` pairs, including YAML block scalars (`key: >-` or `key: |`). */
+export function parseFrontmatter(markdown: string): {
 	metadata: Record<string, string>;
 	body: string;
 } {
@@ -72,13 +73,26 @@ function parseFrontmatter(markdown: string): {
 	}
 
 	const metadata: Record<string, string> = {};
-	for (const line of lines.slice(1, end)) {
+	const frontmatter = lines.slice(1, end);
+	for (let i = 0; i < frontmatter.length; i += 1) {
+		const line = frontmatter[i] ?? "";
+		if (/^\s/.test(line)) {
+			continue;
+		}
 		const delimiter = line.indexOf(":");
 		if (delimiter <= 0) {
 			continue;
 		}
 		const key = line.slice(0, delimiter).trim().toLowerCase();
-		const value = line.slice(delimiter + 1).trim();
+		let value = line.slice(delimiter + 1).trim();
+		if (/^[>|][+-]?$/.test(value)) {
+			const block: string[] = [];
+			while (i + 1 < frontmatter.length && /^(\s|$)/.test(frontmatter[i + 1] ?? "")) {
+				i += 1;
+				block.push((frontmatter[i] ?? "").trim());
+			}
+			value = block.join(value.startsWith(">") ? " " : "\n").trim();
+		}
 		if (key && value) {
 			metadata[key] = value;
 		}
@@ -222,6 +236,36 @@ export async function loadCustomSkills(
 	}
 
 	return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * The Cursor SDK does not give the model skills that are in a subfolder of the workspace
+ * (for example `<workspace>/core/.agents/skills`), so the adapter lists them itself.
+ */
+export function nestedWorkspaceSkillsPrompt(
+	skills: CustomSkill[],
+	workspace: string,
+): string | undefined {
+	const topLevelSkillDirs = WORKSPACE_CONFIG_DIR_NAMES.map(
+		(name) => path.join(workspace, name, "skills") + path.sep,
+	);
+	const nested = skills.filter(
+		(skill) =>
+			skill.origin === "workspace" &&
+			!topLevelSkillDirs.some((dir) => skill.sourcePath.startsWith(dir)),
+	);
+	if (nested.length === 0) {
+		return undefined;
+	}
+	return [
+		"<workspace_skills>",
+		"These agent skills are in subfolders of the workspace. When a task matches a skill's description, read its SKILL.md file and follow it.",
+		...nested.map(
+			(skill) =>
+				`- ${skill.name}: ${skill.description.replace(/\s+/g, " ")} (${skill.sourcePath})`,
+		),
+		"</workspace_skills>",
+	].join("\n");
 }
 
 export function resolveSkillPrompt(commandName: string, skills: CustomSkill[]): string | null {

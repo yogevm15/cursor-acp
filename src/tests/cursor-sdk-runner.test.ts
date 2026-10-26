@@ -135,6 +135,29 @@ describe("CursorSdkRunner", () => {
 		expect(sdkMocks.agentCreate.mock.calls[1]?.[0].local).not.toHaveProperty("dirs");
 	});
 
+	it("adds the new chat prefix only to the first prompt of a new agent", async () => {
+		const created = sdkAgent("agent-new");
+		const resumed = sdkAgent("agent-saved");
+		sdkMocks.agentCreate.mockResolvedValue(created);
+		sdkMocks.agentResume.mockResolvedValue(resumed);
+		const runner = new CursorSdkRunner("test-key", logger);
+		const base = { workspace: "/tmp/project", newChatPromptPrefix: "<skills/>" };
+
+		await runner.startPrompt({
+			...base,
+			backendSessionId: await runner.createChat(),
+			prompt: "one",
+		}).completed;
+		await runner.startPrompt({ ...base, backendSessionId: "agent-new", prompt: "two" })
+			.completed;
+		await runner.startPrompt({ ...base, backendSessionId: "agent-saved", prompt: "three" })
+			.completed;
+
+		expect(created.send).toHaveBeenNthCalledWith(1, "<skills/>\n\none", expect.anything());
+		expect(created.send).toHaveBeenNthCalledWith(2, "two", expect.anything());
+		expect(resumed.send).toHaveBeenCalledWith("three", expect.anything());
+	});
+
 	it("resumes with Auto Review disabled for an approved retry without SDK force", async () => {
 		const reviewed = sdkAgent("agent-existing");
 		const approved = sdkAgent("agent-existing");

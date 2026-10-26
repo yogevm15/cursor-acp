@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { findWorkspaceConfigDirs, loadCustomSkills } from "../skills.js";
+import {
+	findWorkspaceConfigDirs,
+	loadCustomSkills,
+	nestedWorkspaceSkillsPrompt,
+	parseFrontmatter,
+} from "../skills.js";
 
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
 	await mkdir(dir, { recursive: true });
@@ -54,6 +59,78 @@ describe("skills", () => {
 		} finally {
 			await rm(tempRoot, { recursive: true, force: true });
 		}
+	});
+
+	it("reads folded and literal block scalars in frontmatter", () => {
+		const { metadata, body } = parseFrontmatter(
+			[
+				"---",
+				"name: bump",
+				"description: >-",
+				"  Bump the patch version",
+				"  and add a CHANGELOG line.",
+				"notes: |",
+				"  first",
+				"  second",
+				"metadata:",
+				"  surfaces: ide",
+				"---",
+				"Body",
+			].join("\n"),
+		);
+		expect(metadata).toEqual({
+			name: "bump",
+			description: "Bump the patch version and add a CHANGELOG line.",
+			notes: "first\nsecond",
+		});
+		expect(body).toBe("Body");
+	});
+
+	it("lists only workspace skills in subfolders for the model", () => {
+		const workspace = path.join(path.sep, "repos");
+		const skill = (name: string, sourcePath: string, origin: "workspace" | "user") => ({
+			name,
+			description: `${name}\ndescription`,
+			template: "body",
+			sourcePath,
+			origin,
+		});
+
+		const prompt = nestedWorkspaceSkillsPrompt(
+			[
+				skill(
+					"top",
+					path.join(workspace, ".cursor", "skills", "top", "SKILL.md"),
+					"workspace",
+				),
+				skill(
+					"top-agents",
+					path.join(workspace, ".agents", "skills", "a", "SKILL.md"),
+					"workspace",
+				),
+				skill(
+					"core-bazel",
+					path.join(workspace, "core", ".agents", "skills", "core-bazel", "SKILL.md"),
+					"workspace",
+				),
+				skill(
+					"user",
+					path.join(path.sep, "home", ".agents", "skills", "u", "SKILL.md"),
+					"user",
+				),
+			],
+			workspace,
+		);
+
+		expect(prompt).toBe(
+			[
+				"<workspace_skills>",
+				"These agent skills are in subfolders of the workspace. When a task matches a skill's description, read its SKILL.md file and follow it.",
+				`- core-bazel: core-bazel description (${path.join(workspace, "core", ".agents", "skills", "core-bazel", "SKILL.md")})`,
+				"</workspace_skills>",
+			].join("\n"),
+		);
+		expect(nestedWorkspaceSkillsPrompt([], workspace)).toBeUndefined();
 	});
 
 	it("lists workspace config directories breadth-first and stops at the scan limit", async () => {

@@ -109,7 +109,7 @@ import {
 	resolveCustomSlashCommandPrompt,
 	resolveSkillSlashCommandPrompt,
 } from "./slash-commands.js";
-import { CustomSkill, loadCustomSkills } from "./skills.js";
+import { CustomSkill, loadCustomSkills, nestedWorkspaceSkillsPrompt } from "./skills.js";
 import { adapterVersion } from "./version.js";
 import { resolveWorkspaceRoots } from "./workspace-roots.js";
 import { SubagentTracker } from "./subagents.js";
@@ -2521,6 +2521,7 @@ export class CursorAcpAgent implements Agent {
 			workspaceRoots: session.workspaceRoots,
 			backendSessionId: session.backendSessionId,
 			prompt: (session.historyPromptPrefix ?? "") + promptText,
+			newChatPromptPrefix: nestedWorkspaceSkillsPrompt(session.customSkills, session.cwd),
 			images,
 			modelId: session.modelId,
 			modeId: modeSettings.modeId,
